@@ -338,6 +338,41 @@ fn partials_and_finals_reach_the_watchers() {
     ]);
 }
 
+// Seen live: two readings of the same words won in turn for dozens of steps.
+#[test]
+fn a_partial_read_two_ways_in_turn_does_not_blink() {
+    let engine = FakeEngine {
+        script: vec![
+            (0, EngineEvent::Ready),
+            (1_600, partial(1, "une personne de manière")),
+            (3_200, partial(1, "une personne. de manière simple")),
+            (4_800, partial(1, "une personne de manière simple, avec")),
+            (
+                6_400,
+                partial(1, "une personne. de manière simple, avec son"),
+            ),
+            (
+                8_000,
+                final_(1, "une personne de manière simple, avec son nom."),
+            ),
+            (9_600, partial(2, "Quand")),
+        ],
+        ..FakeEngine::default()
+    };
+    let (daemon, _, _) = daemon(FakeMic::default(), engine);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&state(State::Listening));
+    watcher.expect(&[
+        ev_partial(1, "une personne de manière"),
+        ev_partial(1, "une personne de manière simple"),
+        ev_partial(1, "une personne de manière simple, avec"),
+        ev_partial(1, "une personne de manière simple, avec son"),
+        ev_final(1, "une personne de manière simple, avec son nom."),
+        ev_partial(2, "Quand"),
+    ]);
+}
+
 #[test]
 fn levels_are_published_while_listening() {
     let (daemon, _, _) = daemon(FakeMic::default(), ready_engine());

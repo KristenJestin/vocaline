@@ -8,6 +8,7 @@
 use crate::audio::{Capture, Microphone, SAMPLE_RATE, rms};
 use crate::engine::{Engine, EngineEvent, EngineInput};
 use crate::events::{Event, State, VERSION};
+use crate::steady::Steady;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -137,6 +138,7 @@ pub fn spawn(
         stop: Arc::new(AtomicBool::new(false)),
         last_utterance: 0,
         open_utterance: None,
+        partial: Steady::default(),
         hold,
         clock,
         pressed_at: None,
@@ -162,6 +164,8 @@ struct Core {
     last_utterance: u64,
     /// The engine's number of the open utterance, and ours.
     open_utterance: Option<(u64, u64)>,
+    /// The partial of the open utterance, as shown.
+    partial: Steady,
     hold: Duration,
     clock: Clock,
     /// When the key went down and started the dictation; none for a press that stopped it.
@@ -288,7 +292,9 @@ impl Core {
             }
             EngineEvent::Partial { utterance, text } => {
                 let utterance = self.utterance(utterance);
-                self.bus.publish(&Event::Partial { utterance, text });
+                if let Some(text) = self.partial.read(&text) {
+                    self.bus.publish(&Event::Partial { utterance, text });
+                }
             }
             EngineEvent::Final { utterance, text } => {
                 let utterance = self.utterance(utterance);
@@ -314,6 +320,7 @@ impl Core {
             _ => {
                 self.last_utterance += 1;
                 self.open_utterance = Some((engine, self.last_utterance));
+                self.partial = Steady::default();
                 self.last_utterance
             }
         }

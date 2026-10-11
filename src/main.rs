@@ -4,6 +4,7 @@ mod config;
 mod daemon;
 mod engine;
 mod events;
+mod steady;
 
 use audio::{Microphone, PwRecord, WavFile};
 use cli::Cli;
