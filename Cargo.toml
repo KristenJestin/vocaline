@@ -8,3 +8,4 @@ description = "Live local dictation: the phrase shows while you speak, and is pa
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 toml = "1.1.8"
+wl-clipboard-rs = "0.9"
