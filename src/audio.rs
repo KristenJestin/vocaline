@@ -1,12 +1,18 @@
 //! Where the audio comes from: 16 kHz mono signed 16-bit samples, behind a trait so the daemon
 //! is tested without a microphone.
 
-use std::io::{self, Read};
+use std::collections::VecDeque;
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub const SAMPLE_RATE: u32 = 16_000;
+
+/// Lines of the recorder's diagnostics kept to explain a failure; the rest is dropped.
+const KEPT_DIAGNOSTICS: usize = 12;
 
 pub trait Microphone: Send + Sync {
     fn open(&self) -> io::Result<Box<dyn Capture>>;
@@ -22,8 +28,8 @@ pub trait Capture: Send {
 pub struct PwRecord;
 
 impl PwRecord {
-    fn command() -> Command {
-        let mut command = Command::new("pw-record");
+    fn command(program: &Path) -> Command {
+        let mut command = Command::new(program);
         command.args([
             "--raw",
             "--rate",
@@ -38,22 +44,74 @@ impl PwRecord {
     }
 }
 
-impl Microphone for PwRecord {
-    fn open(&self) -> io::Result<Box<dyn Capture>> {
-        let mut child = PwRecord::command()
+impl PwRecord {
+    fn spawn(program: &Path) -> io::Result<Box<dyn Capture>> {
+        let mut child = PwRecord::command(program)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| io::Error::new(e.kind(), format!("pw-record: {e}")))?;
         let stdout = child.stdout.take().expect("piped");
-        Ok(Box::new(PwCapture { child, stdout }))
+        let stderr = child.stderr.take().expect("piped");
+        let diagnostics = Arc::new(Mutex::new(VecDeque::new()));
+        let kept = Arc::clone(&diagnostics);
+        let diagnostics_thread = thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let mut kept = kept.lock().unwrap();
+                kept.push_back(line);
+                if kept.len() > KEPT_DIAGNOSTICS {
+                    kept.pop_front();
+                }
+            }
+        });
+        Ok(Box::new(PwCapture {
+            child,
+            stdout,
+            heard: false,
+            diagnostics,
+            diagnostics_thread: Some(diagnostics_thread),
+        }))
+    }
+}
+
+impl Microphone for PwRecord {
+    fn open(&self) -> io::Result<Box<dyn Capture>> {
+        PwRecord::spawn(Path::new("pw-record"))
     }
 }
 
 struct PwCapture {
     child: Child,
     stdout: ChildStdout,
+    heard: bool,
+    diagnostics: Arc<Mutex<VecDeque<String>>>,
+    diagnostics_thread: Option<JoinHandle<()>>,
+}
+
+impl PwCapture {
+    /// The recorder closed its output on its own: that is only a clean end if it said so and
+    /// had recorded something. A normal stop kills it, and nobody reads after that.
+    fn ended(&mut self) -> io::Result<usize> {
+        let status = self.child.wait()?;
+        if let Some(thread) = self.diagnostics_thread.take() {
+            let _ = thread.join();
+        }
+        if status.success() && self.heard {
+            return Ok(0);
+        }
+        let kept = self.diagnostics.lock().unwrap();
+        let last: Vec<&str> = kept.iter().map(String::as_str).collect();
+        let why = if status.success() {
+            "ended before any audio".to_string()
+        } else {
+            format!("stopped ({status})")
+        };
+        Err(io::Error::other(format!(
+            "pw-record {why}: {}",
+            last.join(" | ")
+        )))
+    }
 }
 
 impl Capture for PwCapture {
@@ -66,6 +124,10 @@ impl Capture for PwCapture {
                 n => filled += n,
             }
         }
+        if filled == 0 {
+            return self.ended();
+        }
+        self.heard = true;
         for (sample, pair) in buf.iter_mut().zip(bytes[..filled].as_chunks::<2>().0) {
             *sample = i16::from_le_bytes(*pair);
         }
@@ -248,12 +310,48 @@ mod tests {
 
     #[test]
     fn pw_record_captures_16_khz_mono_raw_samples_on_its_output() {
-        let command = PwRecord::command();
+        let command = PwRecord::command(Path::new("pw-record"));
         assert_eq!(command.get_program(), "pw-record");
         let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
         assert_eq!(
             args.join(" "),
             "--raw --rate 16000 --channels 1 --format s16 -"
         );
+    }
+
+    /// A stand-in for `pw-record`: a shell script, so the capture is tested without PipeWire.
+    fn fake_pw_record(name: &str, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = std::env::temp_dir().join(format!("vocaline-pw-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_recorder_that_fails_at_once_ends_the_capture_with_its_diagnostics() {
+        let script = "echo 'error: connection refused' >&2; echo 'no PipeWire' >&2; exit 1";
+        let mut capture = PwRecord::spawn(&fake_pw_record("fails", script)).unwrap();
+        let error = capture.read(&mut [0; 160]).unwrap_err().to_string();
+        assert!(error.contains("pw-record"), "{error}");
+        assert!(error.contains("connection refused"), "{error}");
+        assert!(error.contains("no PipeWire"), "{error}");
+    }
+
+    #[test]
+    fn a_recorder_that_ends_without_any_audio_is_an_error_even_when_it_exits_well() {
+        let mut capture = PwRecord::spawn(&fake_pw_record("silent", "exit 0")).unwrap();
+        assert!(capture.read(&mut [0; 160]).is_err());
+    }
+
+    #[test]
+    fn a_recorder_that_ends_after_its_audio_ends_the_capture_quietly() {
+        let script = "head -c 640 /dev/zero";
+        let mut capture = PwRecord::spawn(&fake_pw_record("clean", script)).unwrap();
+        let mut buf = [1; 320];
+        assert_eq!(capture.read(&mut buf).unwrap(), 320);
+        assert_eq!(capture.read(&mut buf).unwrap(), 0);
     }
 }

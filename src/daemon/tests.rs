@@ -15,12 +15,15 @@ const WAIT: Duration = Duration::from_secs(5);
 struct FakeMic {
     chunks: Option<usize>,
     fail: bool,
+    /// The capture opens, then fails on its first read, as `pw-record` does without PipeWire.
+    read_error: Option<&'static str>,
     opened: AtomicUsize,
     open_now: Arc<AtomicUsize>,
 }
 
 struct FakeCapture {
     left: Option<usize>,
+    read_error: Option<&'static str>,
     open_now: Arc<AtomicUsize>,
 }
 
@@ -33,6 +36,7 @@ impl Microphone for FakeMic {
         self.open_now.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(FakeCapture {
             left: self.chunks,
+            read_error: self.read_error,
             open_now: Arc::clone(&self.open_now),
         }))
     }
@@ -40,6 +44,9 @@ impl Microphone for FakeMic {
 
 impl Capture for FakeCapture {
     fn read(&mut self, buf: &mut [i16]) -> io::Result<usize> {
+        if let Some(message) = self.read_error {
+            return Err(io::Error::other(message));
+        }
         if let Some(left) = &mut self.left {
             if *left == 0 {
                 return Ok(0);
@@ -443,6 +450,25 @@ fn a_microphone_that_cannot_open_leaves_the_daemon_idle() {
     assert!(error.contains("no microphone"), "{error}");
     assert_eq!(daemon.command(Command::Status), Ok(State::Idle));
     assert!(engine.sink.lock().unwrap().is_none(), "no engine loaded");
+}
+
+#[test]
+fn a_microphone_that_fails_at_once_says_why_then_the_daemon_returns_to_idle() {
+    let mic = FakeMic {
+        read_error: Some("pw-record stopped (exit status: 1): connection refused"),
+        ..FakeMic::default()
+    };
+    let (daemon, mic, _) = daemon(mic, ready_engine());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&Event::Error {
+        message: "the microphone failed: pw-record stopped (exit status: 1): connection refused"
+            .into(),
+    });
+    watcher.expect(&[state(State::Stopping), state(State::Idle)]);
+    wait_until("the microphone is closed", || {
+        mic.open_now.load(Ordering::SeqCst) == 0
+    });
 }
 
 #[test]
