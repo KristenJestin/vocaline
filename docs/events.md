@@ -14,13 +14,20 @@ writes one command on one line, and reads the answer.
 
 | Command | Answer |
 |---|---|
+| `press` | the key went down: `stop` when loading or listening, otherwise `start` and remember when; answers the state reached |
+| `release` | the key went up: `stop` if it is still loading or listening and the key was held at least `hold_ms` (250 ms by default) since the `press` that started it; otherwise nothing; answers the state |
 | `start` | starts listening; answers the state reached |
 | `stop` | stops listening, the open phrase is finalised; answers the state reached |
 | `toggle` | `start` when idle, `stop` when loading or listening |
 | `status` | the current state |
 | `watch` | the event stream, until the client hangs up |
 
-The answer to `start`, `stop`, `toggle` and `status` is one JSON line, then the daemon closes the
+`press` and `release` are for one key bound to both (hold to talk, or tap to start and tap to
+stop). A `release` with no `press` before it, or after a `press` that stopped the dictation, does
+nothing. A `press` while stopping is refused, like `start`. `start`, `stop` and `toggle` are for
+callers that are not a key. The event stream does not change.
+
+The answer to `press`, `release`, `start`, `stop`, `toggle` and `status` is one JSON line, then the daemon closes the
 connection:
 
 ```json
