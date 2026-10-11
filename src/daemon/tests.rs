@@ -231,8 +231,60 @@ fn ev_final(utterance: u64, text: &str) -> Event {
 fn daemon(mic: FakeMic, engine: FakeEngine) -> (Handle, Arc<FakeMic>, Arc<FakeEngine>) {
     let mic = Arc::new(mic);
     let engine = Arc::new(engine);
-    let handle = spawn(mic.clone(), engine.clone(), HOLD, Arc::new(Instant::now));
+    let handle = spawn(
+        mic.clone(),
+        engine.clone(),
+        None,
+        HOLD,
+        Arc::new(Instant::now),
+    );
     (handle, mic, engine)
+}
+
+/// What the daemon handed to the output.
+#[derive(Debug, Clone, PartialEq)]
+enum Handed {
+    Begin,
+    Phrase(String),
+}
+
+#[derive(Clone, Default)]
+struct FakePaste(Arc<Mutex<Vec<Handed>>>);
+
+impl Paste for FakePaste {
+    fn begin(&self) {
+        self.0.lock().unwrap().push(Handed::Begin);
+    }
+
+    fn phrase(&self, text: String) {
+        self.0.lock().unwrap().push(Handed::Phrase(text));
+    }
+}
+
+/// A daemon that pastes into a fake output.
+fn pasting_daemon(engine: FakeEngine) -> (Handle, FakePaste) {
+    let paste = FakePaste::default();
+    let handle = spawn(
+        Arc::new(FakeMic::default()),
+        Arc::new(engine),
+        Some(Box::new(paste.clone())),
+        HOLD,
+        Arc::new(Instant::now),
+    );
+    (handle, paste)
+}
+
+fn two_phrases() -> FakeEngine {
+    FakeEngine {
+        script: vec![
+            (0, EngineEvent::Ready),
+            (1_600, partial(1, "Bonjour")),
+            (3_200, final_(1, "Bonjour.")),
+            (4_800, partial(2, "Ça")),
+        ],
+        on_finish: vec![final_(2, "Ça va ?")],
+        ..FakeEngine::default()
+    }
 }
 
 const HOLD: Duration = Duration::from_millis(250);
@@ -266,7 +318,7 @@ impl FakeClock {
 fn keyed_daemon(engine: FakeEngine) -> (Handle, FakeClock, Arc<FakeMic>) {
     let clock = FakeClock::new();
     let mic = Arc::new(FakeMic::default());
-    let handle = spawn(mic.clone(), Arc::new(engine), HOLD, clock.clock());
+    let handle = spawn(mic.clone(), Arc::new(engine), None, HOLD, clock.clock());
     (handle, clock, mic)
 }
 
@@ -760,7 +812,7 @@ fn a_press_that_cannot_start_leaves_the_release_without_effect() {
         fail: true,
         ..FakeMic::default()
     });
-    let daemon = spawn(mic, Arc::new(ready_engine()), HOLD, clock.clock());
+    let daemon = spawn(mic, Arc::new(ready_engine()), None, HOLD, clock.clock());
     assert!(daemon.command(Command::Press).is_err());
     clock.advance(ms(2_000));
     assert_eq!(daemon.command(Command::Release), Ok(State::Idle));
@@ -787,4 +839,61 @@ fn press_and_release_go_through_the_socket() {
     assert_eq!(ask(&path, "press"), "{\"state\":\"loading\"}\n");
     clock.advance(ms(300));
     assert_eq!(ask(&path, "release"), "{\"state\":\"stopping\"}\n");
+}
+
+#[test]
+fn each_final_is_handed_to_the_output_after_the_dictation_began() {
+    let (daemon, paste) = pasting_daemon(two_phrases());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&ev_partial(2, "Ça"));
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        *paste.0.lock().unwrap(),
+        [
+            Handed::Begin,
+            Handed::Phrase("Bonjour.".into()),
+            Handed::Phrase("Ça va ?".into()),
+        ]
+    );
+}
+
+#[test]
+fn start_no_paste_hands_nothing_to_the_output_and_the_stream_has_the_finals() {
+    let (daemon, paste) = pasting_daemon(two_phrases());
+    let watcher = Watcher::on(&daemon);
+    assert_eq!(daemon.command(Command::StartNoPaste), Ok(State::Loading));
+    watcher.skip_to(&ev_final(1, "Bonjour."));
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&ev_final(2, "Ça va ?"));
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(*paste.0.lock().unwrap(), []);
+}
+
+#[test]
+fn a_dictation_after_one_without_paste_pastes_again() {
+    let (daemon, paste) = pasting_daemon(ready_engine());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::StartNoPaste).unwrap();
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Stopping));
+    watcher.skip_to(&state(State::Idle));
+    daemon.command(Command::Start).unwrap();
+    assert_eq!(*paste.0.lock().unwrap(), [Handed::Begin]);
+}
+
+#[test]
+fn start_no_paste_goes_through_the_socket() {
+    let path = socket_path("no-paste.sock");
+    let (daemon, paste) = pasting_daemon(ready_engine());
+    let listener = bind(&path).unwrap();
+    thread::spawn(move || serve(listener, daemon));
+
+    assert_eq!(ask(&path, "start --no-paste"), "{\"state\":\"loading\"}\n");
+    assert_eq!(
+        ask(&path, "start --no-paste"),
+        "{\"state\":\"listening\"}\n"
+    );
+    assert_eq!(*paste.0.lock().unwrap(), []);
 }

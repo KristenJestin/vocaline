@@ -10,6 +10,7 @@ use audio::{Microphone, PwRecord, WavFile};
 use cli::Cli;
 use config::{Config, Dirs};
 use engine::CrispAsr;
+use output::{Hyprland, Output, Paste, Ports, Timing, Wayland, Wtype};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -57,9 +58,19 @@ fn run_daemon(dirs: &Dirs, audio_file: Option<&Path>) -> Result<(), String> {
     let listener = daemon::bind(&socket).map_err(|e| format!("{}: {e}", socket.display()))?;
     eprintln!("vocaline: listening for commands on {}", socket.display());
     let hold = Duration::from_millis(config.key.hold_ms);
+    let paste = config.output.paste.then(|| {
+        Box::new(Output::spawn(
+            Ports {
+                desktop: Arc::new(Hyprland),
+                clipboard: Arc::new(Wayland),
+                keyboard: Arc::new(Wtype),
+            },
+            Timing::default(),
+        )) as Box<dyn Paste>
+    });
     daemon::serve(
         listener,
-        daemon::spawn(mic, engine, hold, Arc::new(Instant::now)),
+        daemon::spawn(mic, engine, paste, hold, Arc::new(Instant::now)),
     );
     Ok(())
 }
