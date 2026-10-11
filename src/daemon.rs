@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A watcher that cannot take a line within this delay is dropped rather than slowing the
 /// daemon down.
@@ -23,6 +23,10 @@ const WATCHER_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
+    /// The key went down: stop when listening, otherwise start and remember when.
+    Press,
+    /// The key went up: stop if it was held long enough.
+    Release,
     Start,
     Stop,
     Toggle,
@@ -32,6 +36,8 @@ pub enum Command {
 impl Command {
     pub fn parse(word: &str) -> Option<Command> {
         match word {
+            "press" => Some(Command::Press),
+            "release" => Some(Command::Release),
             "start" => Some(Command::Start),
             "stop" => Some(Command::Stop),
             "toggle" => Some(Command::Toggle),
@@ -42,6 +48,8 @@ impl Command {
 
     pub fn word(self) -> &'static str {
         match self {
+            Command::Press => "press",
+            Command::Release => "release",
             Command::Start => "start",
             Command::Stop => "stop",
             Command::Toggle => "toggle",
@@ -107,8 +115,17 @@ impl Handle {
     }
 }
 
-/// Starts the daemon's thread.
-pub fn spawn(mic: Arc<dyn Microphone>, engine: Arc<dyn Engine>) -> Handle {
+/// What tells the time to the key's hold-or-tap rule; a test moves it by hand.
+pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// Starts the daemon's thread. A key held for `hold` or more stops the dictation it started when
+/// it is released.
+pub fn spawn(
+    mic: Arc<dyn Microphone>,
+    engine: Arc<dyn Engine>,
+    hold: Duration,
+    clock: Clock,
+) -> Handle {
     let (messages, inbox) = mpsc::channel();
     let mut core = Core {
         mic,
@@ -120,6 +137,9 @@ pub fn spawn(mic: Arc<dyn Microphone>, engine: Arc<dyn Engine>) -> Handle {
         stop: Arc::new(AtomicBool::new(false)),
         last_utterance: 0,
         open_utterance: None,
+        hold,
+        clock,
+        pressed_at: None,
     };
     thread::spawn(move || {
         for message in inbox {
@@ -142,6 +162,10 @@ struct Core {
     last_utterance: u64,
     /// The engine's number of the open utterance, and ours.
     open_utterance: Option<(u64, u64)>,
+    hold: Duration,
+    clock: Clock,
+    /// When the key went down and started the dictation; none for a press that stopped it.
+    pressed_at: Option<Instant>,
 }
 
 impl Core {
@@ -175,6 +199,32 @@ impl Core {
     fn command(&mut self, command: Command) -> Reply {
         match (command, self.state) {
             (Command::Status, state) => Ok(state),
+            (Command::Press, State::Idle) => {
+                let reply = self.start();
+                if reply.is_ok() {
+                    self.pressed_at = Some((self.clock)());
+                }
+                reply
+            }
+            (Command::Press, State::Stopping) => {
+                self.pressed_at = None;
+                Err("still stopping the last dictation, try again".into())
+            }
+            (Command::Press, State::Loading | State::Listening) => {
+                self.pressed_at = None;
+                self.command(Command::Stop)
+            }
+            // A release with no press before it (the key was down before the daemon ran, or the
+            // press was lost) has no start to answer for: it is not a hold.
+            (Command::Release, state) => match self.pressed_at.take() {
+                Some(at)
+                    if matches!(state, State::Loading | State::Listening)
+                        && (self.clock)().saturating_duration_since(at) >= self.hold =>
+                {
+                    self.command(Command::Stop)
+                }
+                _ => Ok(state),
+            },
             (Command::Start | Command::Toggle, State::Idle) => self.start(),
             (Command::Start, state @ (State::Loading | State::Listening)) => Ok(state),
             (Command::Start | Command::Toggle, State::Stopping) => {

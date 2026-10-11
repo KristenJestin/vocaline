@@ -11,6 +11,8 @@ usage: vocaline <command>
 
   daemon [--audio-file <wav>]  own the microphone and the engine; with --audio-file, each
                                dictation plays that 16 kHz mono recording instead
+  press                        the key went down: stop when listening, otherwise start
+  release                      the key went up: stop if it was held long enough (hold-to-talk)
   start                        start listening
   stop                         stop listening; the open phrase is finalised
   toggle                       start, or stop
@@ -118,6 +120,14 @@ mod tests {
         assert_eq!(
             Cli::parse(&args(&["toggle"])),
             Ok(Cli::Command(Command::Toggle))
+        );
+        assert_eq!(
+            Cli::parse(&args(&["press"])),
+            Ok(Cli::Command(Command::Press))
+        );
+        assert_eq!(
+            Cli::parse(&args(&["release"])),
+            Ok(Cli::Command(Command::Release))
         );
         assert_eq!(
             Cli::parse(&args(&["status"])),

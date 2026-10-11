@@ -51,6 +51,10 @@ partial_ms = 400                              # the open phrase is decoded again
 final_silence_ms = 700                        # this much silence ends a phrase
 ```
 
+[key]
+hold_ms = 250                                 # a key held this long stops on release (see below)
+```
+
 ## Using it
 
 ```sh
@@ -62,3 +66,17 @@ vocaline start         # or stop, toggle, status
 The model is loaded when listening starts and unloaded when it stops.
 `vocaline daemon --audio-file speech.wav` plays a 16 kHz mono recording instead of the
 microphone at each `start`: to try a machine without speaking.
+
+## One key for hold and tap
+
+Vocaline grabs no key: bind `vocaline press` to the key going down and `vocaline release` to the
+same key going up. On Hyprland:
+
+```
+bind = SUPER, A, exec, vocaline press
+bindr = SUPER, A, exec, vocaline release
+```
+
+Hold the key while you speak and release it to stop. Or tap it (shorter than `hold_ms`): it keeps
+listening, and the next press stops it. Either way, the phrase being spoken is finalised first.
+`start`, `stop` and `toggle` stay for a button or another program.
