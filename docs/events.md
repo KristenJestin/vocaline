@@ -17,6 +17,7 @@ writes one command on one line, and reads the answer.
 | `press` | the key went down: `stop` when loading or listening, otherwise `start` and remember when; answers the state reached |
 | `release` | the key went up: `stop` if it is still loading or listening and the key was held at least `hold_ms` (250 ms by default) since the `press` that started it; otherwise nothing; answers the state |
 | `start` | starts listening; answers the state reached |
+| `start --no-paste` | `start`, but the final phrases of this dictation are not pasted, only streamed |
 | `stop` | stops listening, the open phrase is finalised; answers the state reached |
 | `toggle` | `start` when idle, `stop` when loading or listening |
 | `status` | the current state |

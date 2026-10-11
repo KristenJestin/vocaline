@@ -13,7 +13,8 @@ usage: vocaline <command>
                                dictation plays that 16 kHz mono recording instead
   press                        the key went down: stop when listening, otherwise start
   release                      the key went up: stop if it was held long enough (hold-to-talk)
-  start                        start listening
+  start [--no-paste]           start listening; with --no-paste, the final phrases are only
+                               in the event stream, nothing is pasted
   stop                         stop listening; the open phrase is finalised
   toggle                       start, or stop
   status                       print the state: idle, loading, listening or stopping
@@ -35,6 +36,7 @@ impl Cli {
             ["daemon", "--audio-file", path] => Ok(Cli::Daemon {
                 audio_file: Some(PathBuf::from(path)),
             }),
+            ["start", "--no-paste"] => Ok(Cli::Command(Command::StartNoPaste)),
             ["watch"] => Ok(Cli::Watch),
             ["help" | "--help" | "-h"] => Ok(Cli::Help),
             [word] => Command::parse(word)
@@ -132,6 +134,10 @@ mod tests {
         assert_eq!(
             Cli::parse(&args(&["status"])),
             Ok(Cli::Command(Command::Status))
+        );
+        assert_eq!(
+            Cli::parse(&args(&["start", "--no-paste"])),
+            Ok(Cli::Command(Command::StartNoPaste))
         );
         assert_eq!(Cli::parse(&args(&["watch"])), Ok(Cli::Watch));
         assert_eq!(Cli::parse(&args(&["--help"])), Ok(Cli::Help));
