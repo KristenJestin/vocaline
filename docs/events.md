@@ -83,5 +83,7 @@ The states:
 - A `final` can arrive while `stopping`: stopping finalises the open phrase instead of losing
   it. `idle` comes after the last `final`.
 - A partial can be empty or shorter than the previous one: it is the engine's latest reading,
-  not a growing prefix.
+  not a growing prefix. That reading is steadied: a word already shown changes only when two
+  readings in a row agree on the change, so the phrase does not blink between two readings. The
+  last word follows the engine at once. The `final` is not steadied.
 - A reader that cannot keep up is disconnected rather than slowing the daemon down.

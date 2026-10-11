@@ -34,7 +34,17 @@ impl CrispAsr {
             .args(["-l", &c.language, "--gpu-backend", c.backend.name()])
             .args(["--vad", "--vad-model", &c.vad_model])
             .args(["--stream-step", &c.partial_ms.to_string()])
-            .args(["--stream-length", "30000"])
+            // The partial is decoded from this rolling window: shorter than an utterance, it
+            // drops the utterance's start. 60 s is where crispasr cuts an utterance anyway.
+            .args(["--stream-length", "60000"])
+            // Each step decodes only the last 6 to 9 s and keeps the text before them, so a
+            // step costs the same at minute one as at second five. 4 s misread words, 8 s
+            // cost a third more CPU for no better text.
+            .args(["--stream-partial-tail-sec", "6"])
+            // A breath shorter than the pause that ends a phrase no longer splits it into
+            // slices: crispasr caches at most 8 of them, then decodes them all at every step.
+            // crispasr clamps the gap just below the final silence.
+            .args(["--stream-vad-merge-gap-ms", &c.final_silence_ms.to_string()])
             .args([
                 "--stream-final-on-silence-ms",
                 &c.final_silence_ms.to_string(),
@@ -220,6 +230,29 @@ mod tests {
             );
         }
         assert!(!args.contains(&"--mic"), "the daemon owns the microphone");
+    }
+
+    // A minute-long utterance lost its start from the partial after 30 s, and each step decoded
+    // all of it again: 22 s of CPU for 63 s of audio, measured.
+    #[test]
+    fn a_long_utterance_keeps_its_start_in_the_partial_at_a_bounded_cost() {
+        let config = EngineConfig {
+            final_silence_ms: 900,
+            ..EngineConfig::default()
+        };
+        let command = CrispAsr::new(config).command();
+        let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+        let joined = args.join(" ");
+        for expected in [
+            "--stream-length 60000",
+            "--stream-partial-tail-sec 6",
+            "--stream-vad-merge-gap-ms 900",
+        ] {
+            assert!(
+                joined.contains(expected),
+                "{expected} missing from {joined}"
+            );
+        }
     }
 
     // OpenMP threads spin while the GPU works: 38 s of CPU for 17 s of audio, measured.
