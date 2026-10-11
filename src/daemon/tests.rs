@@ -231,8 +231,43 @@ fn ev_final(utterance: u64, text: &str) -> Event {
 fn daemon(mic: FakeMic, engine: FakeEngine) -> (Handle, Arc<FakeMic>, Arc<FakeEngine>) {
     let mic = Arc::new(mic);
     let engine = Arc::new(engine);
-    let handle = spawn(mic.clone(), engine.clone());
+    let handle = spawn(mic.clone(), engine.clone(), HOLD, Arc::new(Instant::now));
     (handle, mic, engine)
+}
+
+const HOLD: Duration = Duration::from_millis(250);
+
+/// A clock that only moves when a test says so: no test waits for the 250 ms of a hold.
+#[derive(Clone)]
+struct FakeClock {
+    start: Instant,
+    elapsed: Arc<Mutex<Duration>>,
+}
+
+impl FakeClock {
+    fn new() -> FakeClock {
+        FakeClock {
+            start: Instant::now(),
+            elapsed: Arc::default(),
+        }
+    }
+
+    fn advance(&self, by: Duration) {
+        *self.elapsed.lock().unwrap() += by;
+    }
+
+    fn clock(&self) -> Clock {
+        let this = self.clone();
+        Arc::new(move || this.start + *this.elapsed.lock().unwrap())
+    }
+}
+
+/// A daemon with the fake clock, for the commands of a key.
+fn keyed_daemon(engine: FakeEngine) -> (Handle, FakeClock, Arc<FakeMic>) {
+    let clock = FakeClock::new();
+    let mic = Arc::new(FakeMic::default());
+    let handle = spawn(mic.clone(), Arc::new(engine), HOLD, clock.clock());
+    (handle, clock, mic)
 }
 
 fn ready_engine() -> FakeEngine {
@@ -589,4 +624,167 @@ fn a_socket_left_by_a_dead_daemon_is_replaced() {
     drop(UnixListener::bind(&path).unwrap());
     assert!(path.exists());
     assert!(bind(&path).is_ok());
+}
+
+fn ms(n: u64) -> Duration {
+    Duration::from_millis(n)
+}
+
+#[test]
+fn hold_listens_from_the_press_to_the_release_then_the_phrase_is_final() {
+    let engine = FakeEngine {
+        script: vec![(0, EngineEvent::Ready), (1_600, partial(1, "Je dis"))],
+        on_finish: vec![final_(1, "Je dis ceci.")],
+        ..FakeEngine::default()
+    };
+    let (daemon, clock, mic) = keyed_daemon(engine);
+    let watcher = Watcher::on(&daemon);
+    assert_eq!(daemon.command(Command::Press), Ok(State::Loading));
+    watcher.skip_to(&ev_partial(1, "Je dis"));
+    clock.advance(ms(2_000));
+    assert_eq!(daemon.command(Command::Release), Ok(State::Stopping));
+    watcher.expect(&[
+        state(State::Stopping),
+        ev_final(1, "Je dis ceci."),
+        state(State::Idle),
+    ]);
+    wait_until("the microphone is closed", || {
+        mic.open_now.load(Ordering::SeqCst) == 0
+    });
+}
+
+#[test]
+fn a_release_at_the_threshold_stops_and_a_shorter_one_does_not() {
+    let (daemon, clock, _) = keyed_daemon(ready_engine());
+    daemon.command(Command::Press).unwrap();
+    clock.advance(ms(249));
+    // The fake engine may already be ready: what matters is that it is not stopping.
+    let reached = daemon.command(Command::Release).unwrap();
+    assert!(
+        matches!(reached, State::Loading | State::Listening),
+        "{reached:?}"
+    );
+
+    let (daemon, clock, _) = keyed_daemon(ready_engine());
+    daemon.command(Command::Press).unwrap();
+    clock.advance(ms(250));
+    assert_eq!(daemon.command(Command::Release), Ok(State::Stopping));
+}
+
+#[test]
+fn tap_then_tap_keeps_listening_then_stops() {
+    let (daemon, clock, _) = keyed_daemon(ready_engine());
+    let watcher = Watcher::on(&daemon);
+    assert_eq!(daemon.command(Command::Press), Ok(State::Loading));
+    clock.advance(ms(80));
+    daemon.command(Command::Release).unwrap();
+    watcher.skip_to(&state(State::Listening));
+    assert_eq!(daemon.command(Command::Status), Ok(State::Listening));
+
+    clock.advance(ms(10_000));
+    assert_eq!(daemon.command(Command::Press), Ok(State::Stopping));
+    // The release of the tap that stopped it must not stop anything else.
+    clock.advance(ms(80));
+    daemon.command(Command::Release).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(daemon.command(Command::Status), Ok(State::Idle));
+}
+
+#[test]
+fn a_long_press_that_stops_a_dictation_does_not_start_another_on_release() {
+    let (daemon, clock, mic) = keyed_daemon(ready_engine());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Press).unwrap();
+    clock.advance(ms(50));
+    daemon.command(Command::Release).unwrap();
+    watcher.skip_to(&state(State::Listening));
+    daemon.command(Command::Press).unwrap();
+    clock.advance(ms(2_000));
+    daemon.command(Command::Release).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(daemon.command(Command::Status), Ok(State::Idle));
+    assert_eq!(mic.opened.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_press_while_loading_stops_without_a_second_start() {
+    let engine = FakeEngine {
+        hold_end: true,
+        ..FakeEngine::default()
+    };
+    let (daemon, clock, mic) = keyed_daemon(engine);
+    assert_eq!(daemon.command(Command::Press), Ok(State::Loading));
+    clock.advance(ms(80));
+    daemon.command(Command::Release).unwrap();
+    assert_eq!(daemon.command(Command::Status), Ok(State::Loading));
+    assert_eq!(daemon.command(Command::Press), Ok(State::Stopping));
+    assert_eq!(mic.opened.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_release_without_a_press_does_nothing() {
+    let (daemon, clock, mic) = keyed_daemon(ready_engine());
+    clock.advance(ms(5_000));
+    assert_eq!(daemon.command(Command::Release), Ok(State::Idle));
+    assert_eq!(mic.opened.load(Ordering::SeqCst), 0);
+
+    // Listening, started by `start`: a stray release is not a hold.
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&state(State::Listening));
+    clock.advance(ms(5_000));
+    assert_eq!(daemon.command(Command::Release), Ok(State::Listening));
+}
+
+#[test]
+fn a_press_while_stopping_is_refused_and_its_release_does_nothing() {
+    let engine = FakeEngine {
+        script: vec![(0, EngineEvent::Ready)],
+        hold_end: true,
+        ..FakeEngine::default()
+    };
+    let (daemon, clock, _) = keyed_daemon(engine);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&state(State::Listening));
+    daemon.command(Command::Stop).unwrap();
+    assert!(daemon.command(Command::Press).is_err());
+    clock.advance(ms(2_000));
+    assert_eq!(daemon.command(Command::Release), Ok(State::Stopping));
+}
+
+#[test]
+fn a_press_that_cannot_start_leaves_the_release_without_effect() {
+    let clock = FakeClock::new();
+    let mic = Arc::new(FakeMic {
+        fail: true,
+        ..FakeMic::default()
+    });
+    let daemon = spawn(mic, Arc::new(ready_engine()), HOLD, clock.clock());
+    assert!(daemon.command(Command::Press).is_err());
+    clock.advance(ms(2_000));
+    assert_eq!(daemon.command(Command::Release), Ok(State::Idle));
+}
+
+#[test]
+fn start_stop_and_toggle_still_work_beside_a_key() {
+    let (daemon, clock, _) = keyed_daemon(ready_engine());
+    let watcher = Watcher::on(&daemon);
+    assert_eq!(daemon.command(Command::Toggle), Ok(State::Loading));
+    watcher.skip_to(&state(State::Listening));
+    clock.advance(ms(1_000));
+    assert_eq!(daemon.command(Command::Stop), Ok(State::Stopping));
+    watcher.skip_to(&state(State::Idle));
+}
+
+#[test]
+fn press_and_release_go_through_the_socket() {
+    let path = socket_path("keys.sock");
+    let (daemon, clock, _) = keyed_daemon(ready_engine());
+    let listener = bind(&path).unwrap();
+    thread::spawn(move || serve(listener, daemon));
+
+    assert_eq!(ask(&path, "press"), "{\"state\":\"loading\"}\n");
+    clock.advance(ms(300));
+    assert_eq!(ask(&path, "release"), "{\"state\":\"stopping\"}\n");
 }

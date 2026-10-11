@@ -48,6 +48,21 @@ impl Dirs {
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub engine: EngineConfig,
+    pub key: KeyConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeyConfig {
+    /// A key held at least this long stops the dictation on release; a shorter press is a tap
+    /// that leaves it listening.
+    pub hold_ms: u64,
+}
+
+impl Default for KeyConfig {
+    fn default() -> KeyConfig {
+        KeyConfig { hold_ms: 250 }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -158,6 +173,13 @@ mod tests {
         assert_eq!(engine.language, "fr");
         assert_eq!(engine.partial_ms, 400);
         assert_eq!(engine.final_silence_ms, 700);
+    }
+
+    #[test]
+    fn the_key_holds_for_250_ms_by_default_and_the_file_can_change_it() {
+        assert_eq!(Config::parse("", &dirs()).unwrap().key.hold_ms, 250);
+        let config = Config::parse("[key]\nhold_ms = 400", &dirs()).unwrap();
+        assert_eq!(config.key.hold_ms, 400);
     }
 
     #[test]

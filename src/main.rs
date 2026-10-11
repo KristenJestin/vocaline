@@ -12,6 +12,7 @@ use engine::CrispAsr;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -54,6 +55,10 @@ fn run_daemon(dirs: &Dirs, audio_file: Option<&Path>) -> Result<(), String> {
     let socket = dirs.socket();
     let listener = daemon::bind(&socket).map_err(|e| format!("{}: {e}", socket.display()))?;
     eprintln!("vocaline: listening for commands on {}", socket.display());
-    daemon::serve(listener, daemon::spawn(mic, engine));
+    let hold = Duration::from_millis(config.key.hold_ms);
+    daemon::serve(
+        listener,
+        daemon::spawn(mic, engine, hold, Arc::new(Instant::now)),
+    );
     Ok(())
 }
