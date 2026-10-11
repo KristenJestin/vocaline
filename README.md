@@ -49,10 +49,12 @@ backend = "cuda"                              # cuda, vulkan or cpu
 language = "fr"
 partial_ms = 400                              # the open phrase is decoded again this often
 final_silence_ms = 700                        # this much silence ends a phrase
-```
 
 [key]
 hold_ms = 250                                 # a key held this long stops on release (see below)
+
+[output]
+paste = true                                  # false: the phrases are only in the event stream
 ```
 
 ## Using it
@@ -80,3 +82,23 @@ bindr = SUPER, A, exec, vocaline release
 Hold the key while you speak and release it to stop. Or tap it (shorter than `hold_ms`): it keeps
 listening, and the next press stops it. Either way, the phrase being spoken is finalised first.
 `start`, `stop` and `toggle` stay for a button or another program.
+
+## Pasting
+
+Each final phrase is pasted in the window that had the focus when the dictation started, even if
+the focus moved since: the focus is given back to it first (if it was closed, the phrase goes
+where the focus is). Phrases are separated by a space, the first of a dictation has none.
+
+The phrase goes through the clipboard and a paste shortcut typed by `wtype`: Ctrl+Shift+V in a
+terminal (foot, Alacritty, kitty, Ghostty, WezTerm…), Ctrl+V elsewhere. The clipboard is put
+back as it was, with every type it held (a screenshot stays a screenshot), 400 ms after the last
+phrase: the application reads the clipboard on its own time after the shortcut. The phrase is
+offered with the `x-kde-passwordManagerHint` type, so a clipboard history that honours it keeps
+no copy of what was dictated.
+
+While a modifier is held (SUPER of SUPER+A, Ctrl, Alt, Shift), the paste waits for its release:
+pressed with it, the shortcut would be another one.
+
+It needs Hyprland with its Lua API (it is asked which window has the focus and which keys are
+down), `wtype`, and a compositor with the Wayland data-control protocol. `vocaline start
+--no-paste`, or `paste = false`, leaves the phrases in the event stream only.

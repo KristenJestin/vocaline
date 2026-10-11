@@ -8,6 +8,7 @@
 use crate::audio::{Capture, Microphone, SAMPLE_RATE, rms};
 use crate::engine::{Engine, EngineEvent, EngineInput};
 use crate::events::{Event, State, VERSION};
+use crate::output::Paste;
 use crate::steady::Steady;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, BufReader, Write};
@@ -29,6 +30,8 @@ pub enum Command {
     /// The key went up: stop if it was held long enough.
     Release,
     Start,
+    /// Start, with nothing pasted: for a program that only reads the stream.
+    StartNoPaste,
     Stop,
     Toggle,
     Status,
@@ -40,6 +43,7 @@ impl Command {
             "press" => Some(Command::Press),
             "release" => Some(Command::Release),
             "start" => Some(Command::Start),
+            "start --no-paste" => Some(Command::StartNoPaste),
             "stop" => Some(Command::Stop),
             "toggle" => Some(Command::Toggle),
             "status" => Some(Command::Status),
@@ -52,6 +56,7 @@ impl Command {
             Command::Press => "press",
             Command::Release => "release",
             Command::Start => "start",
+            Command::StartNoPaste => "start --no-paste",
             Command::Stop => "stop",
             Command::Toggle => "toggle",
             Command::Status => "status",
@@ -119,11 +124,12 @@ impl Handle {
 /// What tells the time to the key's hold-or-tap rule; a test moves it by hand.
 pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
-/// Starts the daemon's thread. A key held for `hold` or more stops the dictation it started when
-/// it is released.
+/// Starts the daemon's thread. Each final phrase goes to `paste`, if any. A key held for `hold`
+/// or more stops the dictation it started when it is released.
 pub fn spawn(
     mic: Arc<dyn Microphone>,
     engine: Arc<dyn Engine>,
+    paste: Option<Box<dyn Paste>>,
     hold: Duration,
     clock: Clock,
 ) -> Handle {
@@ -139,6 +145,8 @@ pub fn spawn(
         last_utterance: 0,
         open_utterance: None,
         partial: Steady::default(),
+        paste,
+        pasting: false,
         hold,
         clock,
         pressed_at: None,
@@ -166,6 +174,9 @@ struct Core {
     open_utterance: Option<(u64, u64)>,
     /// The partial of the open utterance, as shown.
     partial: Steady,
+    paste: Option<Box<dyn Paste>>,
+    /// The current dictation's finals are pasted.
+    pasting: bool,
     hold: Duration,
     clock: Clock,
     /// When the key went down and started the dictation; none for a press that stopped it.
@@ -204,7 +215,7 @@ impl Core {
         match (command, self.state) {
             (Command::Status, state) => Ok(state),
             (Command::Press, State::Idle) => {
-                let reply = self.start();
+                let reply = self.start(true);
                 if reply.is_ok() {
                     self.pressed_at = Some((self.clock)());
                 }
@@ -229,9 +240,13 @@ impl Core {
                 }
                 _ => Ok(state),
             },
-            (Command::Start | Command::Toggle, State::Idle) => self.start(),
-            (Command::Start, state @ (State::Loading | State::Listening)) => Ok(state),
-            (Command::Start | Command::Toggle, State::Stopping) => {
+            (Command::Start | Command::Toggle, State::Idle) => self.start(true),
+            (Command::StartNoPaste, State::Idle) => self.start(false),
+            (
+                Command::Start | Command::StartNoPaste,
+                state @ (State::Loading | State::Listening),
+            ) => Ok(state),
+            (Command::Start | Command::StartNoPaste | Command::Toggle, State::Stopping) => {
                 Err("still stopping the last dictation, try again".into())
             }
             (Command::Stop | Command::Toggle, State::Loading | State::Listening) => {
@@ -243,7 +258,7 @@ impl Core {
         }
     }
 
-    fn start(&mut self) -> Reply {
+    fn start(&mut self, paste: bool) -> Reply {
         // The microphone first: if it cannot open, no model is loaded for nothing.
         let capture = self
             .mic
@@ -272,6 +287,12 @@ impl Core {
             dictation,
         };
         thread::spawn(move || pump.run());
+        self.pasting = paste && self.paste.is_some();
+        if self.pasting
+            && let Some(output) = &self.paste
+        {
+            output.begin();
+        }
         self.set(State::Loading);
         Ok(State::Loading)
     }
@@ -299,6 +320,11 @@ impl Core {
             EngineEvent::Final { utterance, text } => {
                 let utterance = self.utterance(utterance);
                 self.open_utterance = None;
+                if self.pasting
+                    && let Some(output) = &self.paste
+                {
+                    output.phrase(text.clone());
+                }
                 self.bus.publish(&Event::Final { utterance, text });
             }
             EngineEvent::Silence => self.bus.publish(&Event::Silence),

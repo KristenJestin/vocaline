@@ -49,6 +49,21 @@ impl Dirs {
 pub struct Config {
     pub engine: EngineConfig,
     pub key: KeyConfig,
+    pub output: OutputConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OutputConfig {
+    /// Paste each final phrase where the dictation started; off, the phrases are only in the
+    /// event stream (for a voice assistant).
+    pub paste: bool,
+}
+
+impl Default for OutputConfig {
+    fn default() -> OutputConfig {
+        OutputConfig { paste: true }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -180,6 +195,13 @@ mod tests {
         assert_eq!(Config::parse("", &dirs()).unwrap().key.hold_ms, 250);
         let config = Config::parse("[key]\nhold_ms = 400", &dirs()).unwrap();
         assert_eq!(config.key.hold_ms, 400);
+    }
+
+    #[test]
+    fn pasting_is_on_by_default_and_the_file_can_turn_it_off() {
+        assert!(Config::parse("", &dirs()).unwrap().output.paste);
+        let config = Config::parse("[output]\npaste = false", &dirs()).unwrap();
+        assert!(!config.output.paste);
     }
 
     #[test]
