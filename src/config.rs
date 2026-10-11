@@ -85,7 +85,8 @@ impl Default for KeyConfig {
 pub struct EngineConfig {
     /// The `crispasr` binary: a path, or a name looked up in `PATH`.
     pub command: PathBuf,
-    /// The Parakeet GGUF file; a relative path is read from `$XDG_DATA_HOME/vocaline/models`.
+    /// The GGUF model, Parakeet or Canary: crispasr knows which from the file. A relative path
+    /// is read from `$XDG_DATA_HOME/vocaline/models`.
     pub model: PathBuf,
     /// The Silero VAD model, or `auto` to let CrispASR fetch and cache it.
     pub vad_model: String,
