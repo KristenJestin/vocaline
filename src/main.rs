@@ -1,3 +1,4 @@
+mod audio;
 mod config;
 mod engine;
 mod events;
