@@ -39,6 +39,15 @@ impl Command {
             _ => None,
         }
     }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Command::Start => "start",
+            Command::Stop => "stop",
+            Command::Toggle => "toggle",
+            Command::Status => "status",
+        }
+    }
 }
 
 /// The state reached, or why the command was refused.
