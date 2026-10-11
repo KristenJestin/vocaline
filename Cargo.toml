@@ -1,0 +1,7 @@
+[package]
+name = "vocaline"
+version = "0.0.0"
+edition = "2024"
+description = "Live local dictation: the phrase shows while you speak, and is pasted at the pause"
+
+[dependencies]
