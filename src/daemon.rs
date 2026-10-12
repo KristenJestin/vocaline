@@ -10,6 +10,7 @@ use crate::engine::{Engine, EngineEvent, EngineInput};
 use crate::events::{Event, State, VERSION};
 use crate::output::Paste;
 use crate::rules::{self, Rule};
+use crate::stats::{self, Dictation, Ledger};
 use crate::steady::Steady;
 use crate::vocabulary::Vocabulary;
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,7 @@ use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -168,12 +169,38 @@ impl Handle {
 /// What tells the time to the key's hold-or-tap rule; a test moves it by hand.
 pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
+/// `spawn_recording` with nothing kept of the dictations: most tests have no use for it.
+#[cfg(test)]
+pub fn spawn(
+    mic: Arc<dyn Microphone>,
+    engine: Arc<dyn Engine>,
+    paste: Option<Box<dyn Paste>>,
+    hold: Duration,
+    clock: Clock,
+    vocabulary_file: PathBuf,
+    rules: Vec<Rule>,
+) -> Handle {
+    spawn_recording(
+        None,
+        mic,
+        engine,
+        paste,
+        hold,
+        clock,
+        vocabulary_file,
+        rules,
+    )
+}
+
 /// Starts the daemon's thread. The finals of a dictation go to `paste`, if any, in one piece
 /// once it has stopped. A key held for `hold` or more stops the dictation it started when it
 /// is released. The vocabulary file is read again at each start, so a `teach` or an edit by
 /// hand applies to the next dictation. The first of `rules` that matches the window the
-/// dictation starts in governs it.
-pub fn spawn(
+/// dictation starts in governs it. What is kept of each dictation (counts and durations,
+/// never its text) goes to `ledger`, if any.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_recording(
+    ledger: Option<Box<dyn Ledger>>,
     mic: Arc<dyn Microphone>,
     engine: Arc<dyn Engine>,
     paste: Option<Box<dyn Paste>>,
@@ -205,6 +232,9 @@ pub fn spawn(
         rules,
         rule: None,
         last: VecDeque::new(),
+        ledger,
+        tally: None,
+        stopped_at: None,
     };
     thread::spawn(move || {
         for message in inbox {
@@ -247,6 +277,19 @@ struct Core {
     rule: Option<Rule>,
     /// The last finals, as shown; in memory only, for `last`.
     last: VecDeque<String>,
+    ledger: Option<Box<dyn Ledger>>,
+    /// What is counted of the current dictation, to be kept when it ends.
+    tally: Option<Tally>,
+    /// When the current dictation was told to stop: the paste is timed from there.
+    stopped_at: Option<Instant>,
+}
+
+/// What is kept of a dictation: counts, never its text.
+struct Tally {
+    app: String,
+    words: u32,
+    /// The samples the pump has read, which it keeps adding to until the microphone closes.
+    samples: Arc<AtomicU64>,
 }
 
 impl Core {
@@ -359,7 +402,9 @@ impl Core {
         self.open_utterance = None;
         let (audio, queue) = mpsc::channel();
         thread::spawn(move || feed(input, queue));
+        let samples = Arc::new(AtomicU64::new(0));
         let pump = Pump {
+            samples: Arc::clone(&samples),
             capture,
             stop: Arc::clone(&self.stop),
             bus: Arc::clone(&self.bus),
@@ -376,6 +421,15 @@ impl Core {
         self.rule = forced.or_else(|| rules::select(&self.rules, class.as_deref()).cloned());
         self.pasting = paste.is_some() && self.rule.as_ref().is_none_or(|rule| rule.paste);
         self.dictated.clear();
+        // A dictation whose window was not asked has no application to name.
+        self.tally = Some(Tally {
+            app: class
+                .filter(|class| !class.is_empty())
+                .unwrap_or_else(|| stats::UNKNOWN.into()),
+            words: 0,
+            samples,
+        });
+        self.stopped_at = None;
         self.read_vocabulary();
         self.set(State::Loading);
         Ok(State::Loading)
@@ -428,6 +482,9 @@ impl Core {
                     self.last.pop_front();
                 }
                 self.last.push_back(text.clone());
+                if let Some(tally) = &mut self.tally {
+                    tally.words += stats::count_words(&text);
+                }
                 if self.pasting {
                     self.dictated.push(text.clone());
                 }
@@ -468,6 +525,7 @@ impl Core {
             Some(rule) => rule.finish(&text),
             None => text,
         };
+        let mut pasted = false;
         if !text.is_empty()
             && let Some(output) = &self.paste
         {
@@ -475,6 +533,37 @@ impl Core {
             if self.rule.as_ref().is_some_and(|rule| rule.enter) {
                 output.enter();
             }
+            pasted = true;
+        }
+        self.keep(pasted);
+    }
+
+    /// Keeps the counts of the dictation that ended, once. A store that cannot be written is
+    /// told, and does not fail the dictation. The message holds no text.
+    fn keep(&mut self, pasted: bool) {
+        let Some(tally) = self.tally.take() else {
+            return;
+        };
+        let Some(ledger) = &self.ledger else {
+            return;
+        };
+        // A dictation that heard nothing is not a dictation.
+        if tally.words == 0 {
+            return;
+        }
+        let dictation = Dictation {
+            app: tally.app,
+            words: tally.words,
+            audio_ms: tally.samples.load(Ordering::SeqCst) * 1000 / u64::from(SAMPLE_RATE),
+            paste_ms: self
+                .stopped_at
+                .filter(|_| pasted)
+                .map(|at| (self.clock)().saturating_duration_since(at).as_millis() as u64),
+        };
+        if let Err(e) = ledger.record(&dictation) {
+            self.bus.publish(&Event::Error {
+                message: format!("the statistics could not be written: {e}"),
+            });
         }
     }
 
@@ -493,6 +582,9 @@ impl Core {
 
     fn set(&mut self, state: State) {
         if self.state != state {
+            if state == State::Stopping {
+                self.stopped_at = Some((self.clock)());
+            }
             self.state = state;
             self.bus.publish(&Event::State { state });
         }
@@ -507,6 +599,7 @@ struct Pump {
     audio: mpsc::Sender<Vec<i16>>,
     messages: mpsc::Sender<Message>,
     dictation: u64,
+    samples: Arc<AtomicU64>,
 }
 
 impl Pump {
@@ -518,6 +611,7 @@ impl Pump {
             match self.capture.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    self.samples.fetch_add(n as u64, Ordering::SeqCst);
                     self.bus.publish(&Event::level(rms(&buf[..n])));
                     if self.audio.send(buf[..n].to_vec()).is_err() {
                         break;

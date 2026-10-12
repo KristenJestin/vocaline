@@ -6,6 +6,7 @@ license = "Apache-2.0"
 description = "Live local dictation: the phrase shows while you speak, and is pasted at the pause"
 
 [dependencies]
+jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11"

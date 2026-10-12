@@ -52,6 +52,11 @@ impl Dirs {
         self.config.join("vocabulary.txt")
     }
 
+    /// What the daemon keeps of each dictation: counts and durations, never text.
+    pub fn stats_file(&self) -> PathBuf {
+        self.data.join("stats.jsonl")
+    }
+
     pub fn socket(&self) -> PathBuf {
         self.runtime.join("vocaline.sock")
     }
@@ -356,6 +361,18 @@ mod tests {
         );
         assert_eq!(dirs.data, PathBuf::from("/home/u/.local/share/vocaline"));
         assert_eq!(dirs.socket(), PathBuf::from("/run/user/1/vocaline.sock"));
+    }
+
+    #[test]
+    fn the_statistics_are_kept_in_the_data_folder() {
+        let dirs = Dirs {
+            data: PathBuf::from("/home/u/.local/share/vocaline"),
+            ..dirs()
+        };
+        assert_eq!(
+            dirs.stats_file(),
+            PathBuf::from("/home/u/.local/share/vocaline/stats.jsonl")
+        );
     }
 
     #[test]
