@@ -3,6 +3,14 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// The engine binary when the configuration names none. The Arch package bundles CrispASR in
+/// its own folder and sets `VOCALINE_ENGINE` at build time, so it never clashes with another
+/// `crispasr` in `PATH`; a plain `cargo build` looks it up in `PATH`.
+pub const DEFAULT_ENGINE: &str = match option_env!("VOCALINE_ENGINE") {
+    Some(path) => path,
+    None => "crispasr",
+};
+
 /// The folders Vocaline uses, from the XDG variables.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dirs {
@@ -101,7 +109,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> EngineConfig {
         EngineConfig {
-            command: PathBuf::from("crispasr"),
+            command: PathBuf::from(DEFAULT_ENGINE),
             model: PathBuf::from("parakeet-tdt-0.6b-v3-q8_0.gguf"),
             vad_model: "ggml-silero-v6.2.0.bin".into(),
             backend: Backend::Cuda,
@@ -179,7 +187,7 @@ mod tests {
     fn defaults_are_the_values_of_the_issue() {
         let config = Config::parse("", &dirs()).unwrap();
         let engine = config.engine;
-        assert_eq!(engine.command, PathBuf::from("crispasr"));
+        assert_eq!(engine.command, PathBuf::from(DEFAULT_ENGINE));
         assert_eq!(
             engine.model,
             PathBuf::from("/data/vocaline/models/parakeet-tdt-0.6b-v3-q8_0.gguf")
@@ -248,6 +256,13 @@ mod tests {
             Config::parse(text, &dirs()).unwrap().engine.vad_model,
             "auto"
         );
+    }
+
+    #[test]
+    fn a_build_without_a_bundled_engine_looks_crispasr_up_in_path() {
+        if option_env!("VOCALINE_ENGINE").is_none() {
+            assert_eq!(DEFAULT_ENGINE, "crispasr");
+        }
     }
 
     #[test]
