@@ -18,13 +18,18 @@ usage: vocaline <command>
   stop                         stop listening; the open phrase is finalised
   toggle                       start, or stop
   status                       print the state: idle, loading, listening or stopping
-  watch                        print the event stream, one JSON object per line";
+  watch                        print the event stream, one JSON object per line
+  last                         print the last final phrases of this session, one per line
+  teach \"<heard>\" \"<wanted>\"  add an entry to the vocabulary: what the model writes, and
+                               what you want instead (read from the next dictation on)";
 
 #[derive(Debug, PartialEq)]
 pub enum Cli {
     Daemon { audio_file: Option<PathBuf> },
     Command(Command),
     Watch,
+    Last,
+    Teach { heard: String, wanted: String },
     Help,
 }
 
@@ -38,6 +43,11 @@ impl Cli {
             }),
             ["start", "--no-paste"] => Ok(Cli::Command(Command::StartNoPaste)),
             ["watch"] => Ok(Cli::Watch),
+            ["last"] => Ok(Cli::Last),
+            ["teach", heard, wanted] => Ok(Cli::Teach {
+                heard: heard.to_string(),
+                wanted: wanted.to_string(),
+            }),
             ["help" | "--help" | "-h"] => Ok(Cli::Help),
             [word] => Command::parse(word)
                 .map(Cli::Command)
@@ -49,21 +59,39 @@ impl Cli {
 
 /// Sends `command` to the daemon and returns the state it reached.
 pub fn request(socket: &Path, command: &str) -> Result<State, String> {
+    match ask(socket, command)? {
+        Answer {
+            state: Some(state), ..
+        } => Ok(state),
+        Answer {
+            error: Some(error), ..
+        } => Err(error),
+        answer => Err(format!("unexpected answer from the daemon: {answer:?}")),
+    }
+}
+
+/// The last final phrases of the daemon's session, oldest first.
+pub fn last(socket: &Path) -> Result<Vec<String>, String> {
+    match ask(socket, "last")? {
+        Answer {
+            phrases: Some(phrases),
+            ..
+        } => Ok(phrases),
+        Answer {
+            error: Some(error), ..
+        } => Err(error),
+        answer => Err(format!("unexpected answer from the daemon: {answer:?}")),
+    }
+}
+
+fn ask(socket: &Path, command: &str) -> Result<Answer, String> {
     let mut stream = connect(socket)?;
     writeln!(stream, "{command}").map_err(|e| e.to_string())?;
     let mut line = String::new();
     BufReader::new(stream)
         .read_line(&mut line)
         .map_err(|e| e.to_string())?;
-    match serde_json::from_str(&line) {
-        Ok(Answer {
-            state: Some(state), ..
-        }) => Ok(state),
-        Ok(Answer {
-            error: Some(error), ..
-        }) => Err(error),
-        _ => Err(format!("unexpected answer from the daemon: {line:?}")),
-    }
+    serde_json::from_str(&line).map_err(|_| format!("unexpected answer from the daemon: {line:?}"))
 }
 
 /// Copies the event stream to `out` until the daemon goes away.
@@ -141,6 +169,14 @@ mod tests {
         );
         assert_eq!(Cli::parse(&args(&["watch"])), Ok(Cli::Watch));
         assert_eq!(Cli::parse(&args(&["--help"])), Ok(Cli::Help));
+        assert_eq!(Cli::parse(&args(&["last"])), Ok(Cli::Last));
+        assert_eq!(
+            Cli::parse(&args(&["teach", "foo bar", "Foobar"])),
+            Ok(Cli::Teach {
+                heard: "foo bar".into(),
+                wanted: "Foobar".into()
+            })
+        );
     }
 
     #[test]
@@ -149,6 +185,10 @@ mod tests {
         assert!(Cli::parse(&args(&["dance"])).is_err());
         assert!(Cli::parse(&args(&["start", "now"])).is_err());
         assert!(Cli::parse(&args(&["daemon", "--audio-file"])).is_err());
+        assert!(Cli::parse(&args(&["last", "now"])).is_err());
+        assert!(Cli::parse(&args(&["teach"])).is_err());
+        assert!(Cli::parse(&args(&["teach", "foo bar"])).is_err());
+        assert!(Cli::parse(&args(&["teach", "foo", "bar", "baz"])).is_err());
     }
 
     /// A daemon that answers one connection with `answer` and returns what it was asked.
@@ -185,6 +225,19 @@ mod tests {
     fn no_daemon_is_an_error_that_says_how_to_start_it() {
         let error = request(Path::new("/nonexistent/vocaline.sock"), "status").unwrap_err();
         assert!(error.contains("vocaline daemon"), "{error}");
+    }
+
+    #[test]
+    fn last_returns_the_phrases_the_daemon_kept() {
+        let (path, asked) = one_answer("last.sock", "{\"phrases\":[\"Bonjour.\",\"Ça va ?\"]}\n");
+        assert_eq!(last(&path), Ok(vec!["Bonjour.".into(), "Ça va ?".into()]));
+        assert_eq!(asked.join().unwrap(), "last\n");
+    }
+
+    #[test]
+    fn last_is_an_error_when_the_daemon_does_not_answer_with_phrases() {
+        let (path, _) = one_answer("last-state.sock", "{\"state\":\"idle\"}\n");
+        assert!(last(&path).is_err());
     }
 
     #[test]

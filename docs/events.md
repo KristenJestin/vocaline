@@ -22,6 +22,7 @@ writes one command on one line, and reads the answer.
 | `toggle` | `start` when idle, `stop` when loading or listening |
 | `status` | the current state |
 | `watch` | the event stream, until the client hangs up |
+| `last` | the last final phrases of this session (at most 20, oldest first), kept in memory only |
 
 `press` and `release` are for one key bound to both (hold to talk, or tap to start and tap to
 stop). A `release` with no `press` before it, or after a `press` that stopped the dictation, does
@@ -34,6 +35,12 @@ connection:
 ```json
 {"state":"loading"}
 {"error":"still stopping the last dictation, try again"}
+```
+
+The answer to `last` is one line too, with the phrases as they were shown (after the vocabulary):
+
+```json
+{"phrases":["Bonjour.","Ça va ?"]}
 ```
 
 `vocaline watch` prints the stream to its standard output, so a program can also read it from
@@ -86,4 +93,8 @@ The states:
   not a growing prefix. That reading is steadied: a word already shown changes only when two
   readings in a row agree on the change, so the phrase does not blink between two readings. The
   last word follows the engine at once. The `final` is not steadied.
+- The text of `partial` and `final` is corrected by the user's vocabulary
+  (`$XDG_CONFIG_HOME/vocaline/vocabulary.txt`, see the README): the format does not change, only
+  the words inside. The vocabulary is read when a dictation starts; a line of it that cannot be
+  read is reported by an `error` event at that moment, and the state goes on.
 - A reader that cannot keep up is disconnected rather than slowing the daemon down.
