@@ -1991,3 +1991,352 @@ fn a_rule_name_with_a_space_or_nothing_is_not_a_command() {
         assert_eq!(Command::parse(word), None, "{word:?}");
     }
 }
+
+use crate::stats::{Dictation, Store, UNKNOWN};
+
+/// What the daemon kept of its dictations; with `fail`, a disk that refuses.
+#[derive(Clone, Default)]
+struct FakeLedger {
+    kept: Arc<Mutex<Vec<Dictation>>>,
+    fail: bool,
+}
+
+impl crate::stats::Ledger for FakeLedger {
+    fn record(&self, dictation: &Dictation) -> io::Result<()> {
+        if self.fail {
+            return Err(io::Error::other("disk full"));
+        }
+        self.kept.lock().unwrap().push(dictation.clone());
+        Ok(())
+    }
+}
+
+impl FakeLedger {
+    fn kept(&self) -> Vec<Dictation> {
+        self.kept.lock().unwrap().clone()
+    }
+}
+
+/// A daemon that keeps the statistics of its dictations in `ledger`.
+fn recording_daemon(
+    ledger: Box<dyn crate::stats::Ledger>,
+    mic: Arc<dyn Microphone>,
+    engine: Arc<dyn Engine>,
+    paste: Option<&FakePaste>,
+    clock: Clock,
+    rules: Vec<Rule>,
+) -> Handle {
+    spawn_recording(
+        Some(ledger),
+        mic,
+        engine,
+        paste.map(|paste| Box::new(paste.clone()) as Box<dyn Paste>),
+        HOLD,
+        clock,
+        no_vocabulary(),
+        rules,
+    )
+}
+
+/// A daemon over an invented session: 12 seconds of audio, the engine saying `text`.
+fn session(ledger: &FakeLedger, paste: Option<&FakePaste>, text: &str) -> Handle {
+    let mic = FakeMic {
+        chunks: Some(120),
+        ..FakeMic::default()
+    };
+    recording_daemon(
+        Box::new(ledger.clone()),
+        Arc::new(mic),
+        Arc::new(saying(text)),
+        paste,
+        Arc::new(Instant::now),
+        Vec::new(),
+    )
+}
+
+/// A dictation that ends by itself, when the microphone has nothing more to give.
+fn dictate_to_the_end(daemon: &Handle, start: Command) {
+    let watcher = Watcher::on(daemon);
+    daemon.command(start).unwrap();
+    watcher.skip_to(&state(State::Stopping));
+    watcher.skip_to(&state(State::Idle));
+}
+
+#[test]
+fn a_dictation_is_kept_with_its_application_its_words_and_its_audio() {
+    let paste = FakePaste::in_window("org.example.Editor");
+    let ledger = FakeLedger::default();
+    let daemon = session(&ledger, Some(&paste), "Bonjour tout le monde ?");
+    dictate_to_the_end(&daemon, Command::Start);
+
+    let kept = ledger.kept();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0].app, "org.example.Editor");
+    // The lone question mark is not a word.
+    assert_eq!(kept[0].words, 4);
+    assert_eq!(kept[0].audio_ms, 12_000);
+    assert!(kept[0].paste_ms.is_some(), "{kept:?}");
+}
+
+#[test]
+fn the_time_to_paste_runs_from_the_stop_to_the_paste() {
+    let clock = FakeClock::new();
+    let engine = Arc::new(FakeEngine {
+        script: vec![
+            (0, EngineEvent::Ready),
+            (1_600, final_(1, "Bonjour tout le monde.")),
+        ],
+        hold_end: true,
+        ..FakeEngine::default()
+    });
+    let paste = FakePaste::in_window("org.example.Editor");
+    let ledger = FakeLedger::default();
+    let daemon = recording_daemon(
+        Box::new(ledger.clone()),
+        Arc::new(FakeMic::default()),
+        engine.clone(),
+        Some(&paste),
+        clock.clock(),
+        Vec::new(),
+    );
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&ev_final(1, "Bonjour tout le monde."));
+
+    // The time spent speaking is not the time to paste.
+    clock.advance(Duration::from_secs(5));
+    daemon.command(Command::Stop).unwrap();
+    clock.advance(Duration::from_millis(320));
+    engine.emit(EngineEvent::Flushed);
+    wait_until("the dictation is kept", || !ledger.kept().is_empty());
+    assert_eq!(ledger.kept()[0].paste_ms, Some(320));
+
+    // The engine ending after its flush does not keep the dictation twice.
+    engine.emit(EngineEvent::Ended(Ok(())));
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(ledger.kept().len(), 1);
+}
+
+#[test]
+fn a_dictation_with_nothing_pasted_is_kept_under_an_unknown_application() {
+    let ledger = FakeLedger::default();
+
+    // `start --no-paste`: the window is not even asked.
+    let paste = FakePaste::in_window("org.example.Editor");
+    let daemon = session(&ledger, Some(&paste), "Ça va bien ?");
+    dictate_to_the_end(&daemon, Command::StartNoPaste);
+    assert_eq!(handed(&paste), []);
+
+    // `paste = false` in the configuration: there is no output at all.
+    let daemon = session(&ledger, None, "Ça va bien ?");
+    dictate_to_the_end(&daemon, Command::Start);
+
+    let kept = ledger.kept();
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    for dictation in kept {
+        assert_eq!(dictation.app, UNKNOWN);
+        assert_eq!(dictation.words, 3);
+        assert_eq!(dictation.paste_ms, None);
+    }
+}
+
+#[test]
+fn a_rule_that_pastes_nothing_keeps_the_application_of_the_window() {
+    let ledger = FakeLedger::default();
+    let paste = FakePaste::in_window("org.example.Chat");
+    let quiet = Rule {
+        paste: false,
+        ..rule("quiet", Some("org.example.Chat"))
+    };
+    let daemon = recording_daemon(
+        Box::new(ledger.clone()),
+        Arc::new(FakeMic::default()),
+        Arc::new(saying("Ça va bien ?")),
+        Some(&paste),
+        Arc::new(Instant::now),
+        vec![quiet],
+    );
+    dictate(&daemon, Command::Start);
+    let kept = ledger.kept();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0].app, "org.example.Chat");
+    assert_eq!(kept[0].words, 3);
+    assert_eq!(kept[0].paste_ms, None);
+}
+
+#[test]
+fn a_window_the_desktop_could_not_name_is_an_unknown_application() {
+    let ledger = FakeLedger::default();
+    let paste = FakePaste::default();
+    let daemon = session(&ledger, Some(&paste), "Ça va bien ?");
+    dictate_to_the_end(&daemon, Command::Start);
+    let kept = ledger.kept();
+    assert_eq!(kept[0].app, UNKNOWN);
+    assert!(kept[0].paste_ms.is_some());
+}
+
+#[test]
+fn a_dictation_that_heard_nothing_is_not_kept() {
+    let ledger = FakeLedger::default();
+    let paste = FakePaste::in_window("org.example.Editor");
+    let daemon = recording_daemon(
+        Box::new(ledger.clone()),
+        Arc::new(FakeMic::default()),
+        Arc::new(ready_engine()),
+        Some(&paste),
+        Arc::new(Instant::now),
+        Vec::new(),
+    );
+    dictate(&daemon, Command::Start);
+    assert_eq!(ledger.kept(), []);
+}
+
+#[test]
+fn each_dictation_is_kept_once_whatever_the_engine_says_at_its_end() {
+    let ledger = FakeLedger::default();
+    let engine = FakeEngine {
+        script: vec![(0, EngineEvent::Ready)],
+        on_finish: vec![final_(1, "Bonjour."), EngineEvent::Flushed],
+        ..FakeEngine::default()
+    };
+    let daemon = recording_daemon(
+        Box::new(ledger.clone()),
+        Arc::new(FakeMic::default()),
+        Arc::new(engine),
+        Some(&FakePaste::in_window("org.example.Editor")),
+        Arc::new(Instant::now),
+        Vec::new(),
+    );
+    dictate(&daemon, Command::Start);
+    dictate(&daemon, Command::Start);
+    assert_eq!(ledger.kept().len(), 2);
+}
+
+#[test]
+fn a_store_that_cannot_be_written_is_an_error_event_and_the_dictation_still_pastes() {
+    let ledger = FakeLedger {
+        fail: true,
+        ..FakeLedger::default()
+    };
+    let paste = FakePaste::in_window("org.example.Editor");
+    let daemon = recording_daemon(
+        Box::new(ledger),
+        Arc::new(FakeMic::default()),
+        Arc::new(saying("Quarante licornes dansent.")),
+        Some(&paste),
+        Arc::new(Instant::now),
+        Vec::new(),
+    );
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    daemon.command(Command::Stop).unwrap();
+    // What the event says holds no text: the dictated words stay out of it.
+    watcher.skip_to(&Event::Error {
+        message: "the statistics could not be written: disk full".into(),
+    });
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        handed(&paste),
+        [
+            Handed::Begin,
+            Handed::Phrase("Quarante licornes dansent.".into())
+        ]
+    );
+}
+
+/// A folder of its own for a store, outside the repository.
+fn stats_folder(name: &str) -> PathBuf {
+    let folder = std::env::temp_dir().join(format!("vocaline-stats-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    folder
+}
+
+#[test]
+fn the_store_holds_no_text_after_a_scripted_session() {
+    let folder = stats_folder("no-text");
+    let store = folder.join("vocaline").join("stats.jsonl");
+    let phrases = ["Quarante licornes dansent", "sous Jupiter"];
+    let engine = FakeEngine {
+        script: vec![
+            (0, EngineEvent::Ready),
+            (1_600, partial(1, phrases[0])),
+            (3_200, final_(1, &format!("{}.", phrases[0]))),
+            (4_800, partial(2, phrases[1])),
+        ],
+        on_finish: vec![final_(2, phrases[1])],
+        ..FakeEngine::default()
+    };
+    let paste = FakePaste::in_window("org.example.Editor");
+    let daemon = recording_daemon(
+        Box::new(Store::new(store.clone())),
+        Arc::new(FakeMic::default()),
+        Arc::new(engine),
+        Some(&paste),
+        Arc::new(Instant::now),
+        Vec::new(),
+    );
+    dictate(&daemon, Command::Start);
+    dictate(&daemon, Command::StartNoPaste);
+
+    // Everything the daemon left in the folder, whatever its name.
+    let mut written = String::new();
+    for file in std::fs::read_dir(store.parent().unwrap()).unwrap() {
+        written += &std::fs::read_to_string(file.unwrap().path()).unwrap();
+    }
+    assert_eq!(written.lines().count(), 2, "{written}");
+    let heard = phrases.join(" ").to_lowercase();
+    for word in heard.split_whitespace() {
+        assert!(!written.to_lowercase().contains(word), "{word}: {written}");
+    }
+    // Only counts and durations, and the class of the window: no other key, no other text.
+    for line in written.lines() {
+        let line: serde_json::Value = serde_json::from_str(line).unwrap();
+        for (key, value) in line.as_object().unwrap() {
+            match key.as_str() {
+                "day" | "app" => assert!(value.is_string(), "{key}"),
+                "words" | "audio_ms" | "paste_ms" => assert!(value.is_u64(), "{key}"),
+                _ => panic!("{key} is not a count or a duration"),
+            }
+        }
+    }
+    assert_eq!(written.matches("org.example.Editor").count(), 1);
+}
+
+#[test]
+fn a_few_dictations_in_two_applications_show_up_per_application() {
+    let folder = stats_folder("two-apps");
+    let store = Store::new(folder.join("stats.jsonl"));
+    let paste = FakePaste::in_window("org.example.Editor");
+    let mic = || {
+        Arc::new(FakeMic {
+            chunks: Some(120),
+            ..FakeMic::default()
+        })
+    };
+    let daemon = recording_daemon(
+        Box::new(Store::new(folder.join("stats.jsonl"))),
+        mic(),
+        Arc::new(saying("Bonjour tout le monde.")),
+        Some(&paste),
+        Arc::new(Instant::now),
+        Vec::new(),
+    );
+    dictate_to_the_end(&daemon, Command::Start);
+    dictate_to_the_end(&daemon, Command::Start);
+    *paste.1.lock().unwrap() = Some("org.example.Chat".into());
+    dictate_to_the_end(&daemon, Command::Start);
+
+    let mut out = Vec::new();
+    crate::stats::print(&store, jiff::Zoned::now().date(), false, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let line = |app: &str| {
+        text.lines()
+            .find(|line| line.contains(app))
+            .unwrap_or_else(|| panic!("{app}: {text}"))
+            .to_string()
+    };
+    // Three of twelve seconds, four words each.
+    assert!(text.contains("3 dictations, 12 words, 0.6 min"), "{text}");
+    assert!(line("org.example.Editor").contains("2 dictations, 8 words, 0.4 min"));
+    assert!(line("org.example.Chat").contains("1 dictation, 4 words, 0.2 min"));
+}

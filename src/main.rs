@@ -7,6 +7,7 @@ mod events;
 mod output;
 mod rules;
 mod setup;
+mod stats;
 mod steady;
 mod vocabulary;
 
@@ -61,6 +62,17 @@ fn run(cli: Cli) -> Result<(), String> {
             vocabulary::teach(&dirs.vocabulary_file(), &heard, &wanted)?;
             println!("{} -> {}", heard.trim(), wanted.trim());
         }
+        Cli::Stats { json } => {
+            let skipped = stats::print(
+                &stats::Store::new(dirs.stats_file()),
+                jiff::Zoned::now().date(),
+                json,
+                &mut std::io::stdout().lock(),
+            )?;
+            if skipped > 0 {
+                eprintln!("vocaline: {skipped} unreadable line(s) of the statistics skipped");
+            }
+        }
         Cli::Watch => cli::watch(&dirs.socket(), &mut std::io::stdout().lock())?,
         Cli::Setup => {
             let config = Config::load(&dirs)?;
@@ -98,7 +110,8 @@ fn run_daemon(dirs: &Dirs, audio_file: Option<&Path>) -> Result<(), String> {
     });
     daemon::serve(
         listener,
-        daemon::spawn(
+        daemon::spawn_recording(
+            Some(Box::new(stats::Store::new(dirs.stats_file()))),
             mic,
             engine,
             paste,

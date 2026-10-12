@@ -32,6 +32,10 @@ usage: vocaline <command>
   last                         print the last final phrases of this session, one per line
   teach \"<heard>\" \"<wanted>\"  add an entry to the vocabulary: what the model writes, and
                                what you want instead (read from the next dictation on)
+  stats [--json]               print how much you dictated (today, the last 7 days, all
+                               time) by day and by application, and the time from the stop
+                               to the paste; with --json, one JSON object. Reads the file
+                               the daemon keeps, so the daemon need not run
   setup                        download the model and the VAD model the configuration names,
                                if they are missing; their size is shown first
   --version                    print the version, which names the commit it was built from";
@@ -43,6 +47,7 @@ pub enum Cli {
     Watch,
     Last,
     Teach { heard: String, wanted: String },
+    Stats { json: bool },
     Setup,
     Version,
     Help,
@@ -68,6 +73,8 @@ impl Cli {
                 heard: heard.to_string(),
                 wanted: wanted.to_string(),
             }),
+            ["stats"] => Ok(Cli::Stats { json: false }),
+            ["stats", "--json"] => Ok(Cli::Stats { json: true }),
             ["setup"] => Ok(Cli::Setup),
             ["help" | "--help" | "-h"] => Ok(Cli::Help),
             ["--version" | "-V"] => Ok(Cli::Version),
@@ -210,6 +217,20 @@ mod tests {
                 wanted: "Foobar".into()
             })
         );
+    }
+
+    #[test]
+    fn stats_is_read_with_or_without_json() {
+        assert_eq!(
+            Cli::parse(&args(&["stats"])),
+            Ok(Cli::Stats { json: false })
+        );
+        assert_eq!(
+            Cli::parse(&args(&["stats", "--json"])),
+            Ok(Cli::Stats { json: true })
+        );
+        assert!(Cli::parse(&args(&["stats", "--xml"])).is_err());
+        assert!(Cli::parse(&args(&["stats", "--json", "now"])).is_err());
     }
 
     #[test]

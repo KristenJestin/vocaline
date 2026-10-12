@@ -76,7 +76,7 @@ One JSON object per line, UTF-8, `type` names the event.
 | `partial` | `utterance`, `text` | the phrase being spoken, as heard so far; the next partial of the same utterance replaces it |
 | `final` | `utterance`, `text` | the phrase, frozen at the pause; it replaces the partials of its utterance and closes it |
 | `silence` | | the engine heard no speech in its last step (one per step, every `partial_ms`) |
-| `error` | `message` | something went wrong (the engine could not start or stopped); the state follows |
+| `error` | `message` | something went wrong (the engine could not start or stopped, the statistics could not be written); the state follows |
 
 The states:
 
