@@ -44,6 +44,15 @@ fn run(cli: Cli) -> Result<(), String> {
         Cli::Command(command) => {
             println!("{}", cli::request(&dirs.socket(), command.word())?.name());
         }
+        Cli::Last => {
+            for phrase in cli::last(&dirs.socket())? {
+                println!("{phrase}");
+            }
+        }
+        Cli::Teach { heard, wanted } => {
+            vocabulary::teach(&dirs.vocabulary_file(), &heard, &wanted)?;
+            println!("{} -> {}", heard.trim(), wanted.trim());
+        }
         Cli::Watch => cli::watch(&dirs.socket(), &mut std::io::stdout().lock())?,
     }
     Ok(())
