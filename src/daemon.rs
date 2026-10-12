@@ -511,8 +511,16 @@ impl Core {
             EngineEvent::Flushed if self.state == State::Stopping => self.paste_dictation(),
             EngineEvent::Flushed => {}
             EngineEvent::Ended(result) => {
-                if let Err(message) = result {
-                    self.bus.publish(&Event::Error { message });
+                match result {
+                    Err(message) => self.bus.publish(&Event::Error { message }),
+                    // No stop was asked, or the state would be `Stopping`: an engine that
+                    // leaves by itself must not look like a key that cuts off.
+                    Ok(()) if matches!(self.state, State::Loading | State::Listening) => {
+                        self.bus.publish(&Event::Error {
+                            message: "the engine stopped by itself".into(),
+                        })
+                    }
+                    Ok(()) => {}
                 }
                 // The engine may have failed while the microphone is still open.
                 self.stop.store(true, Ordering::SeqCst);

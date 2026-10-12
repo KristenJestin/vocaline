@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -99,6 +100,8 @@ impl Engine for CrispAsr {
             .map_err(|e| {
                 io::Error::new(e.kind(), format!("{}: {e}", self.config.command.display()))
             })?;
+        let finished = Arc::new(AtomicBool::new(false));
+        let ended_by_us = Arc::clone(&finished);
         let stdin = child.stdin.take().expect("piped");
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
@@ -130,20 +133,21 @@ impl Engine for CrispAsr {
             }
             let _ = diagnostics_thread.join();
             let result = match child.wait() {
-                Ok(status) if status.success() => Ok(()),
-                Ok(status) => {
-                    let kept = diagnostics.lock().unwrap();
-                    let last: Vec<&str> = kept.iter().map(String::as_str).collect();
-                    Err(format!(
-                        "the engine stopped ({status}): {}",
-                        tail(&last.join(" | "))
-                    ))
-                }
+                // A success while the audio was still coming is no end: the engine gave up.
+                Ok(status) if status.success() && ended_by_us.load(Ordering::SeqCst) => Ok(()),
+                Ok(status) if status.success() => Err(format!(
+                    "the engine stopped by itself ({status}): {}",
+                    tail(&diagnostics_text(&diagnostics))
+                )),
+                Ok(status) => Err(format!(
+                    "the engine stopped ({status}): {}",
+                    tail(&diagnostics_text(&diagnostics))
+                )),
                 Err(e) => Err(format!("the engine could not be awaited: {e}")),
             };
             sink(EngineEvent::Ended(result));
         });
-        Ok(Box::new(Input { stdin }))
+        Ok(Box::new(Input { stdin, finished }))
     }
 }
 
@@ -159,8 +163,19 @@ fn tail(text: &str) -> String {
     format!("…{}", &text[from..])
 }
 
+/// The kept lines of the engine's diagnostics, on one line.
+fn diagnostics_text(kept: &Mutex<VecDeque<String>>) -> String {
+    let kept = kept.lock().unwrap();
+    kept.iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 struct Input {
     stdin: ChildStdin,
+    /// Set once the audio has ended, so the exit that follows is the one that was asked for.
+    finished: Arc<AtomicBool>,
 }
 
 impl EngineInput for Input {
@@ -170,7 +185,9 @@ impl EngineInput for Input {
     }
 
     /// Closing the standard input is how crispasr learns the audio ended.
-    fn finish(self: Box<Self>) {}
+    fn finish(self: Box<Self>) {
+        self.finished.store(true, Ordering::SeqCst);
+    }
 }
 
 #[derive(Deserialize)]
@@ -363,7 +380,10 @@ mod tests {
             .collect()
     }
 
-    fn run_timed(script_name: &str, script: &str, audio: &[i16]) -> Vec<(Instant, EngineEvent)> {
+    fn open_fake(
+        script_name: &str,
+        script: &str,
+    ) -> (Box<dyn EngineInput>, mpsc::Receiver<EngineEvent>) {
         let config = EngineConfig {
             command: fake_crispasr(script_name, script),
             ..EngineConfig::default()
@@ -374,7 +394,7 @@ mod tests {
         // someone has open for writing (ETXTBSY). That ends as soon as the child has exec'd, so
         // the open is tried again; it succeeds the first time on a machine that is not busy.
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut input = loop {
+        let input = loop {
             let tx = Mutex::new(tx.clone());
             match CrispAsr::new(config.clone())
                 .open(Box::new(move |e| tx.lock().unwrap().send(e).unwrap()))
@@ -388,6 +408,11 @@ mod tests {
                 result => break result.unwrap(),
             }
         };
+        (input, rx)
+    }
+
+    fn run_timed(script_name: &str, script: &str, audio: &[i16]) -> Vec<(Instant, EngineEvent)> {
+        let (mut input, rx) = open_fake(script_name, script);
         input.write(audio).unwrap();
         input.finish();
         let mut events = Vec::new();
@@ -483,6 +508,27 @@ mod tests {
         assert!(message.ends_with("error: the end, é"), "{message}");
         assert!(!message.contains("line 1:"), "{message}");
         assert!(message.len() <= 500, "{} bytes: {message}", message.len());
+    }
+
+    // The real case of #33 was an engine that left with status 0 before the audio ended.
+    #[test]
+    fn an_engine_that_leaves_by_itself_with_success_is_an_error_with_its_diagnostics() {
+        let script = "echo 'warning: no VAD model, giving up' >&2";
+        let (input, rx) = open_fake("leaves", script);
+        let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let EngineEvent::Ended(Err(message)) = event else {
+            panic!("{event:?}");
+        };
+        assert!(message.contains("by itself"), "{message}");
+        assert!(message.contains("no VAD model"), "{message}");
+        drop(input);
+    }
+
+    #[test]
+    fn a_successful_exit_after_the_end_of_the_audio_stays_silent() {
+        let script = "cat >/dev/null; echo 'info: model unloaded' >&2";
+        let events = run("quiet-exit", script, &[0; 16]);
+        assert_eq!(events, [EngineEvent::Ended(Ok(()))]);
     }
 
     #[test]

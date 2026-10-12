@@ -686,6 +686,27 @@ fn an_engine_that_fails_while_listening_returns_to_idle_with_an_error() {
 }
 
 #[test]
+fn an_engine_that_ends_by_itself_says_so() {
+    let engine = FakeEngine {
+        script: vec![(0, EngineEvent::Ready), (1_600, EngineEvent::Ended(Ok(())))],
+        ..FakeEngine::default()
+    };
+    let (daemon, mic, _) = daemon(FakeMic::default(), engine);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&state(State::Listening));
+    watcher.expect(&[
+        Event::Error {
+            message: "the engine stopped by itself".into(),
+        },
+        state(State::Idle),
+    ]);
+    wait_until("the microphone is closed", || {
+        mic.open_now.load(Ordering::SeqCst) == 0
+    });
+}
+
+#[test]
 fn an_engine_that_cannot_start_leaves_the_daemon_idle() {
     let engine = FakeEngine {
         fail: true,
