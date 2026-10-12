@@ -1,0 +1,74 @@
+# The Arch package is what gets installed, so CI builds it: on a pull request to check it before
+# the merge, on `dev` to publish it as the rolling `dev` pre-release, on a `v*` tag as a release.
+name: package
+
+on:
+  pull_request:
+  push:
+    branches: [dev]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      # git first: without it the checkout has no history, and the version counts commits.
+      - run: pacman -Syu --noconfirm --needed git namcap
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install what the package needs to build and to run
+        working-directory: packaging/arch
+        run: |
+          pacman -S --noconfirm --needed $(source ./PKGBUILD && echo "${depends[@]}" "${makedepends[@]}")
+      # makepkg refuses to run as root.
+      - name: Build the package
+        run: |
+          useradd --create-home builder
+          chown -R builder "$GITHUB_WORKSPACE"
+          su builder -c "git config --global --add safe.directory '$GITHUB_WORKSPACE' && cd '$GITHUB_WORKSPACE/packaging/arch' && makepkg --noconfirm"
+      - name: Check the package
+        working-directory: packaging/arch
+        run: |
+          pacman -Qip ./*.pkg.tar.zst
+          pacman -Qlp ./*.pkg.tar.zst
+          namcap ./*.pkg.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: packaging/arch/*.pkg.tar.zst
+          retention-days: 7
+
+  publish:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Two pushes to dev in a row must not interleave their delete and create.
+    concurrency:
+      group: publish-${{ github.ref }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+      # One `dev` pre-release, replaced each time: its tag moves to the commit just built. The tag
+      # is not `dev`: a tag named like the branch makes `git push origin dev` ambiguous.
+      - name: Publish the dev pre-release
+        if: github.ref == 'refs/heads/dev'
+        run: |
+          gh release delete dev-latest --yes --cleanup-tag || true
+          gh release create dev-latest ./*.pkg.tar.zst --prerelease --target "$GITHUB_SHA" \
+            --title "dev" --notes "The integration branch, built from $GITHUB_SHA."
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          gh release create "$GITHUB_REF_NAME" ./*.pkg.tar.zst --verify-tag \
+            --title "$GITHUB_REF_NAME" --notes "Built from $GITHUB_SHA."
