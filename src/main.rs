@@ -7,6 +7,7 @@ mod events;
 mod output;
 mod setup;
 mod steady;
+mod vocabulary;
 
 use audio::{Microphone, PwRecord, WavFile};
 use cli::Cli;
@@ -43,6 +44,15 @@ fn run(cli: Cli) -> Result<(), String> {
         Cli::Daemon { audio_file } => run_daemon(&dirs, audio_file.as_deref())?,
         Cli::Command(command) => {
             println!("{}", cli::request(&dirs.socket(), command.word())?.name());
+        }
+        Cli::Last => {
+            for phrase in cli::last(&dirs.socket())? {
+                println!("{phrase}");
+            }
+        }
+        Cli::Teach { heard, wanted } => {
+            vocabulary::teach(&dirs.vocabulary_file(), &heard, &wanted)?;
+            println!("{} -> {}", heard.trim(), wanted.trim());
         }
         Cli::Watch => cli::watch(&dirs.socket(), &mut std::io::stdout().lock())?,
         Cli::Setup => {
@@ -81,7 +91,14 @@ fn run_daemon(dirs: &Dirs, audio_file: Option<&Path>) -> Result<(), String> {
     });
     daemon::serve(
         listener,
-        daemon::spawn(mic, engine, paste, hold, Arc::new(Instant::now)),
+        daemon::spawn(
+            mic,
+            engine,
+            paste,
+            hold,
+            Arc::new(Instant::now),
+            dirs.vocabulary_file(),
+        ),
     );
     Ok(())
 }

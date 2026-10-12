@@ -132,3 +132,36 @@ pressed with it, the shortcut would be another one.
 It needs Hyprland with its Lua API (it is asked which window has the focus and which keys are
 down), `wtype`, and a compositor with the Wayland data-control protocol. `vocaline start
 --no-paste`, or `paste = false`, leaves the phrases in the event stream only.
+
+## Your own vocabulary
+
+Parakeet is very good in French but still writes some names its own way. After you see a
+mistake, one command fixes it for good:
+
+```sh
+vocaline teach "foo bar" "Foobar"
+```
+
+It adds a line to `$XDG_CONFIG_HOME/vocaline/vocabulary.txt` (usually
+`~/.config/vocaline/vocabulary.txt`), a plain file you can edit by hand:
+
+```
+# what the model writes -> what I want
+foo bar -> Foobar
+élodie -> Elodie
+```
+
+One entry per line; empty lines and lines starting with `#` are ignored; when two lines hear the
+same words the later one wins. Matching ignores case and accents, and respects word boundaries:
+`bar` changes `bar` and `sous-bar` but not `barbare`. An entry of several words matches them
+across any run of spaces. A line that cannot be read is named in an `error` event and left out;
+the others still apply.
+
+The correction happens where the engine's text enters the daemon, so the partial phrase, the
+final phrase (both in the event stream, see `docs/events.md`) and the pasted text hold the same
+words. The file is read again when a dictation starts: an entry applies from the next dictation,
+and `teach` works with no daemon running.
+
+`vocaline last` prints the last 20 final phrases of the session, as they were shown, one per
+line. They are kept in the daemon's memory only: never written to disk or to a log, and gone when
+the daemon stops.

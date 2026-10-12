@@ -297,6 +297,7 @@ fn daemon(mic: FakeMic, engine: FakeEngine) -> (Handle, Arc<FakeMic>, Arc<FakeEn
         None,
         HOLD,
         Arc::new(Instant::now),
+        no_vocabulary(),
     );
     (handle, mic, engine)
 }
@@ -330,6 +331,7 @@ fn pasting_daemon(engine: FakeEngine) -> (Handle, FakePaste) {
         Some(Box::new(paste.clone())),
         HOLD,
         Arc::new(Instant::now),
+        no_vocabulary(),
     );
     (handle, paste)
 }
@@ -345,6 +347,11 @@ fn two_phrases() -> FakeEngine {
         on_finish: vec![final_(2, "Ça va ?")],
         ..FakeEngine::default()
     }
+}
+
+/// A vocabulary file that does not exist: nothing is corrected.
+fn no_vocabulary() -> PathBuf {
+    PathBuf::from("/nonexistent/vocaline/vocabulary.txt")
 }
 
 const HOLD: Duration = Duration::from_millis(250);
@@ -378,7 +385,14 @@ impl FakeClock {
 fn keyed_daemon(engine: FakeEngine) -> (Handle, FakeClock, Arc<FakeMic>) {
     let clock = FakeClock::new();
     let mic = Arc::new(FakeMic::default());
-    let handle = spawn(mic.clone(), Arc::new(engine), None, HOLD, clock.clock());
+    let handle = spawn(
+        mic.clone(),
+        Arc::new(engine),
+        None,
+        HOLD,
+        clock.clock(),
+        no_vocabulary(),
+    );
     (handle, clock, mic)
 }
 
@@ -392,6 +406,7 @@ fn keyed_pasting_daemon(engine: FakeEngine) -> (Handle, FakeClock, FakePaste) {
         Some(Box::new(paste.clone())),
         HOLD,
         clock.clock(),
+        no_vocabulary(),
     );
     (handle, clock, paste)
 }
@@ -714,6 +729,7 @@ fn slow_daemon(load: Duration, mic: FakeMic) -> (Handle, Arc<AtomicUsize>, FakeP
         Some(Box::new(paste.clone())),
         HOLD,
         Arc::new(Instant::now),
+        no_vocabulary(),
     );
     (handle, before_ready, paste)
 }
@@ -998,7 +1014,14 @@ fn a_press_that_cannot_start_leaves_the_release_without_effect() {
         fail: true,
         ..FakeMic::default()
     });
-    let daemon = spawn(mic, Arc::new(ready_engine()), None, HOLD, clock.clock());
+    let daemon = spawn(
+        mic,
+        Arc::new(ready_engine()),
+        None,
+        HOLD,
+        clock.clock(),
+        no_vocabulary(),
+    );
     assert!(daemon.command(Command::Press).is_err());
     clock.advance(ms(2_000));
     assert_eq!(daemon.command(Command::Release), Ok(State::Idle));
@@ -1211,4 +1234,175 @@ fn start_no_paste_goes_through_the_socket() {
         "{\"state\":\"listening\"}\n"
     );
     assert_eq!(*paste.0.lock().unwrap(), []);
+}
+
+/// A fresh vocabulary file in its own temporary folder.
+fn vocabulary_file(name: &str) -> PathBuf {
+    let folder =
+        std::env::temp_dir().join(format!("vocaline-daemon-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    folder.join("vocabulary.txt")
+}
+
+/// A daemon that pastes into a fake output and reads its vocabulary from `file`.
+fn vocal_daemon(engine: FakeEngine, file: PathBuf) -> (Handle, FakePaste) {
+    let paste = FakePaste::default();
+    let handle = spawn(
+        Arc::new(FakeMic::default()),
+        Arc::new(engine),
+        Some(Box::new(paste.clone())),
+        HOLD,
+        Arc::new(Instant::now),
+        file,
+    );
+    (handle, paste)
+}
+
+/// A phrase with an entry of the vocabulary inside, partial first.
+fn foo_bar_phrase() -> FakeEngine {
+    FakeEngine {
+        script: vec![
+            (0, EngineEvent::Ready),
+            (1_600, partial(1, "Ouvre foo bar")),
+            (3_200, final_(1, "Ouvre foo bar.")),
+        ],
+        ..FakeEngine::default()
+    }
+}
+
+#[test]
+fn after_teach_the_partial_the_final_and_the_paste_hold_the_wanted_word() {
+    let file = vocabulary_file("teach");
+    crate::vocabulary::teach(&file, "foo bar", "Foobar").unwrap();
+    let (daemon, paste) = vocal_daemon(foo_bar_phrase(), file);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&ev_partial(1, "Ouvre Foobar"));
+    watcher.skip_to(&ev_final(1, "Ouvre Foobar."));
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        *paste.0.lock().unwrap(),
+        [Handed::Begin, Handed::Phrase("Ouvre Foobar.".into())]
+    );
+}
+
+#[test]
+fn a_word_that_merely_contains_an_entry_is_not_changed_in_a_dictation() {
+    let file = vocabulary_file("contains");
+    crate::vocabulary::teach(&file, "bar", "Bar").unwrap();
+    let engine = FakeEngine {
+        script: vec![
+            (0, EngineEvent::Ready),
+            (1_600, final_(1, "Un barbare au bar.")),
+        ],
+        ..FakeEngine::default()
+    };
+    let (daemon, paste) = vocal_daemon(engine, file);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&ev_final(1, "Un barbare au Bar."));
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        *paste.0.lock().unwrap(),
+        [Handed::Begin, Handed::Phrase("Un barbare au Bar.".into())]
+    );
+}
+
+#[test]
+fn an_entry_taught_between_two_dictations_applies_to_the_next() {
+    let file = vocabulary_file("between");
+    let (daemon, _) = vocal_daemon(foo_bar_phrase(), file.clone());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&ev_final(1, "Ouvre foo bar."));
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Idle));
+
+    crate::vocabulary::teach(&file, "foo bar", "Foobar").unwrap();
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&ev_final(2, "Ouvre Foobar."));
+}
+
+#[test]
+fn a_line_of_the_vocabulary_that_cannot_be_read_is_an_error_event_and_the_rest_applies() {
+    let file = vocabulary_file("typo");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "foo bar -> Foobar\nnot an entry\n").unwrap();
+    let (daemon, _) = vocal_daemon(foo_bar_phrase(), file);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    let mut error = None;
+    loop {
+        match watcher.next() {
+            Event::Error { message } => error = Some(message),
+            event if event == ev_final(1, "Ouvre Foobar.") => break,
+            _ => {}
+        }
+    }
+    let error = error.expect("an error event");
+    assert!(error.contains("line 2"), "{error}");
+}
+
+#[test]
+fn last_shows_the_last_phrases_as_they_were_shown() {
+    let file = vocabulary_file("last");
+    crate::vocabulary::teach(&file, "foo bar", "Foobar").unwrap();
+    let (daemon, _) = vocal_daemon(foo_bar_phrase(), file);
+    assert_eq!(daemon.last(), Vec::<String>::new());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&ev_final(1, "Ouvre Foobar."));
+    assert_eq!(daemon.last(), ["Ouvre Foobar."]);
+}
+
+#[test]
+fn last_keeps_a_phrase_that_is_not_pasted_and_only_the_latest_ones() {
+    let finals = (1..=LAST_PHRASES as u64 + 5)
+        .map(|n| (n as usize * 1_600, final_(n, &format!("phrase {n}"))))
+        .collect();
+    let engine = FakeEngine {
+        script: [vec![(0, EngineEvent::Ready)], finals].concat(),
+        ..FakeEngine::default()
+    };
+    let (daemon, _, _) = daemon(FakeMic::default(), engine);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::StartNoPaste).unwrap();
+    let total = LAST_PHRASES as u64 + 5;
+    watcher.skip_to(&ev_final(total, &format!("phrase {total}")));
+    let last = daemon.last();
+    assert_eq!(last.len(), LAST_PHRASES);
+    assert_eq!(last.first().unwrap(), "phrase 6");
+    assert_eq!(last.last().unwrap(), &format!("phrase {total}"));
+}
+
+#[test]
+fn after_a_restart_last_shows_nothing() {
+    let (first, _, _) = daemon(FakeMic::default(), two_closed_phrases());
+    let watcher = Watcher::on(&first);
+    first.command(Command::Start).unwrap();
+    watcher.skip_to(&ev_final(2, "Ça va ?"));
+    assert_eq!(first.last(), ["Bonjour.", "Ça va ?"]);
+
+    let (restarted, _, _) = daemon(FakeMic::default(), two_closed_phrases());
+    assert_eq!(restarted.last(), Vec::<String>::new());
+}
+
+#[test]
+fn last_goes_through_the_socket_as_a_list_of_phrases() {
+    let path = socket_path("last.sock");
+    let (daemon, _, _) = daemon(FakeMic::default(), two_closed_phrases());
+    let watcher = Watcher::on(&daemon);
+    let listener = bind(&path).unwrap();
+    let handle = daemon.clone();
+    thread::spawn(move || serve(listener, handle));
+
+    assert_eq!(ask(&path, "last"), "{\"phrases\":[]}\n");
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&ev_final(2, "Ça va ?"));
+    assert_eq!(
+        ask(&path, "last"),
+        "{\"phrases\":[\"Bonjour.\",\"Ça va ?\"]}\n"
+    );
 }

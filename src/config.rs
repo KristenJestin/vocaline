@@ -14,7 +14,7 @@ pub const DEFAULT_ENGINE: &str = match option_env!("VOCALINE_ENGINE") {
 /// The folders Vocaline uses, from the XDG variables.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dirs {
-    /// `$XDG_CONFIG_HOME/vocaline`: holds `config.toml`.
+    /// `$XDG_CONFIG_HOME/vocaline`: holds `config.toml` and `vocabulary.txt`.
     pub config: PathBuf,
     /// `$XDG_DATA_HOME/vocaline`: a relative model path is read from its `models` folder.
     pub data: PathBuf,
@@ -45,6 +45,10 @@ impl Dirs {
 
     pub fn config_file(&self) -> PathBuf {
         self.config.join("config.toml")
+    }
+
+    pub fn vocabulary_file(&self) -> PathBuf {
+        self.config.join("vocabulary.txt")
     }
 
     pub fn socket(&self) -> PathBuf {
