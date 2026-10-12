@@ -8,7 +8,10 @@ Work in progress: see the issues. Agents read `AGENTS.md`.
 ## Installing it (Arch Linux)
 
 CI builds the package: the `dev-latest` pre-release follows the integration branch, each `v*`
-release a version. The version names the commit it was built from (`0.1.0.r42.g1a2b3c4`).
+release a version. A release from the tag `vX.Y.Z` is version `X.Y.Z` (the tag must match
+`Cargo.toml`); any other build is `X.Y.Z.rN.gHASH`, N commits after the last release tag
+(`0.0.0` before the first), so pacman sees a dev build as newer than the release it follows
+and older than the next one. `vocaline --version` prints the same string.
 
 ```sh
 gh release download dev-latest -R KristenJestin/vocaline -p '*.pkg.tar.zst'   # or a v* tag

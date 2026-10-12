@@ -32,12 +32,31 @@ sha256sums=('8bfb828151fd3c9c15e49bbd5a7946ccb1c332be68eb9b3b029fcc4e3e4ce4d2')
 
 _root=$(realpath "$startdir/../..")
 
-# 0.1.0.r42.g1a2b3c4: the version of Cargo.toml, then which commit was built.
+# On a tag vX.Y.Z: X.Y.Z, which must be the version of Cargo.toml. Elsewhere, the usual scheme
+# of a VCS package, X.Y.Z.rN.gHASH: N commits after the last release tag (0.0.0 before the
+# first), so pacman orders a dev build after the release it follows and before the next one.
 pkgver() {
   cd "$_root"
-  local version
-  version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
-  printf '%s.r%s.g%s' "$version" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+  local described tag count
+  if described=$(git describe --long --tags --abbrev=7 --match 'v[0-9]*' 2>/dev/null); then
+    tag=${described%-*-g*}
+    count=${described#"$tag"-}
+    count=${count%%-*}
+  else
+    tag=v0.0.0
+    count=$(git rev-list --count HEAD)
+  fi
+  if [[ $count == 0 && $tag != v0.0.0 ]]; then
+    local cargo
+    cargo=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+    if [[ ${tag#v} != "$cargo" ]]; then
+      error "tag %s does not match the version of Cargo.toml (%s)" "$tag" "$cargo"
+      return 1
+    fi
+    printf '%s' "${tag#v}"
+  else
+    printf '%s.r%s.g%s' "${tag#v}" "$count" "$(git rev-parse --short=7 HEAD)"
+  fi
 }
 
 prepare() {
@@ -47,12 +66,14 @@ prepare() {
 build() {
   export CARGO_TARGET_DIR="$srcdir/target"
   export VOCALINE_ENGINE=/usr/lib/vocaline/crispasr/crispasr
+  export VOCALINE_VERSION=$pkgver
   cargo build --release --frozen --manifest-path "$_root/Cargo.toml"
 }
 
 check() {
   export CARGO_TARGET_DIR="$srcdir/target"
   export VOCALINE_ENGINE=/usr/lib/vocaline/crispasr/crispasr
+  export VOCALINE_VERSION=$pkgver
   cargo test --release --frozen --manifest-path "$_root/Cargo.toml"
 }
 
