@@ -182,7 +182,7 @@ pub fn teach(path: &Path, heard: &str, wanted: &str) -> Result<(), String> {
         .open(path)
         .map_err(fail)?;
     use std::io::Write;
-    write!(file, "{separator}{heard} {ARROW} {wanted}\n").map_err(fail)
+    writeln!(file, "{separator}{heard} {ARROW} {wanted}").map_err(fail)
 }
 
 #[cfg(test)]
