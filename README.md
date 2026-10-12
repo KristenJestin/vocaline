@@ -261,7 +261,8 @@ Vocaline et tout.` No model is involved and it costs nothing.
   empty `text`.
 - It happens right after the vocabulary, where the engine's text comes in, so the partial
   phrase, the final phrase and the pasted text hold the same words. `mm` is in the list because
-  the model writes it for a hum: if you dictate millimetres, take it out.
+  the model writes it for a hum; right after a number (`5 mm`, `2,5 mm`) a filler word is a
+  unit, not a hesitation, and is kept.
 
 ## Statistics
 

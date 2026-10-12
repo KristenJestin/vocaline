@@ -48,7 +48,13 @@ impl Fillers {
         while at < chars.len() {
             let starts_word =
                 chars[at].is_alphanumeric() && (at == 0 || !chars[at - 1].is_alphanumeric());
-            let end = starts_word
+            // A unit after a number (`5 mm`, `2,5 mm`) is not a hesitation.
+            let after_number = chars[..at]
+                .iter()
+                .rev()
+                .find(|c| !c.is_whitespace())
+                .is_some_and(char::is_ascii_digit);
+            let end = (starts_word && !after_number)
                 .then(|| {
                     self.words
                         .iter()
@@ -249,6 +255,21 @@ mod tests {
         let text = "un humain heureux, humble et muet";
         assert_eq!(fillers.drop(text), text);
         assert_eq!(fillers.drop("l'humain euh"), "l'humain");
+    }
+
+    #[test]
+    fn a_unit_after_a_number_is_kept() {
+        let fillers = Fillers::default();
+        for text in [
+            "un tuyau de 5 mm.",
+            "épais de 2,5 mm",
+            "il mesure 0.5 mm de long",
+            "5mm",
+        ] {
+            assert_eq!(fillers.drop(text), text);
+        }
+        // Not after a number: still a hesitation.
+        assert_eq!(fillers.drop("il y a euh 5 mm"), "il y a 5 mm");
     }
 
     #[test]
