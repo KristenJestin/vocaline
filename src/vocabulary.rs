@@ -78,6 +78,18 @@ impl Vocabulary {
         self
     }
 
+    /// Whether the vocabulary writes `word` with a capital, as a word of a wanted text
+    /// (`Foobar`, or `Bar` in `Foo-Bar`): a capital the dictation must keep.
+    pub fn capitalises(&self, word: &str) -> bool {
+        word.chars().next().is_some_and(char::is_uppercase)
+            && self.entries.iter().any(|entry| {
+                entry
+                    .wanted
+                    .split(|c: char| !c.is_alphanumeric())
+                    .any(|wanted| wanted == word)
+            })
+    }
+
     /// The text with every heard entry replaced by the way it must be written.
     pub fn correct(&self, text: &str) -> String {
         if self.entries.is_empty() {
@@ -115,7 +127,7 @@ impl Vocabulary {
 
 /// Where the words `heard` end in `text` when they start at `at`, with only whitespace between
 /// them and a boundary after the last one.
-fn matched(heard: &[Vec<char>], text: &[char], at: usize) -> Option<usize> {
+pub(crate) fn matched(heard: &[Vec<char>], text: &[char], at: usize) -> Option<usize> {
     let mut end = at;
     for (n, word) in heard.iter().enumerate() {
         if n > 0 {
@@ -137,7 +149,7 @@ fn matched(heard: &[Vec<char>], text: &[char], at: usize) -> Option<usize> {
 }
 
 /// Lowercase, without accents: what two spellings of a word have in common.
-fn fold(word: &str) -> Vec<char> {
+pub(crate) fn fold(word: &str) -> Vec<char> {
     word.chars().map(fold_char).collect()
 }
 

@@ -102,4 +102,13 @@ The states:
   (`$XDG_CONFIG_HOME/vocaline/vocabulary.txt`, see the README): the format does not change, only
   the words inside. The vocabulary is read when a dictation starts; a line of it that cannot be
   read is reported by an `error` event at that moment, and the state goes on.
+- The filler words (`euh`, `uh`… the list is in the configuration, see the README) are dropped
+  from `partial` and `final`, after the vocabulary, with the punctuation that hangs on them. A
+  utterance made only of fillers still ends with one `final`, whose `text` is empty: a reader
+  skips it. `last` and the statistics do not keep it.
+- The paste joins the phrases of a dictation a pause has cut (the event stream does not: one
+  `final` per phrase, as heard). A reader that wants the same text does the same: when a
+  `final` ends with an ellipsis (`...` or `…`) or with no closing mark (`.`, `!`, `?`), drop the
+  ellipsis and start the next one lowercase, unless its first word is `I`, in capitals, or has a
+  capital inside; the README gives the rule. Otherwise the two are joined by a space.
 - A reader that cannot keep up is disconnected rather than slowing the daemon down.

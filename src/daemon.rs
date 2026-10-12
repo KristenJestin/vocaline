@@ -9,6 +9,7 @@ use crate::audio::{Capture, Microphone, SAMPLE_RATE, rms};
 use crate::engine::{Engine, EngineEvent, EngineInput};
 use crate::events::{Event, State, VERSION};
 use crate::output::Paste;
+use crate::phrases::{self, Fillers};
 use crate::rules::{self, Rule};
 use crate::stats::{self, Dictation, Ledger};
 use crate::steady::Steady;
@@ -188,6 +189,7 @@ pub fn spawn(
         hold,
         clock,
         vocabulary_file,
+        Fillers::default(),
         rules,
     )
 }
@@ -195,7 +197,8 @@ pub fn spawn(
 /// Starts the daemon's thread. The finals of a dictation go to `paste`, if any, in one piece
 /// once it has stopped. A key held for `hold` or more stops the dictation it started when it
 /// is released. The vocabulary file is read again at each start, so a `teach` or an edit by
-/// hand applies to the next dictation. The first of `rules` that matches the window the
+/// hand applies to the next dictation. The `fillers` are dropped from every phrase, after the
+/// vocabulary has corrected it. The first of `rules` that matches the window the
 /// dictation starts in governs it. What is kept of each dictation (counts and durations,
 /// never its text) goes to `ledger`, if any.
 #[allow(clippy::too_many_arguments)]
@@ -207,6 +210,7 @@ pub fn spawn_recording(
     hold: Duration,
     clock: Clock,
     vocabulary_file: PathBuf,
+    fillers: Fillers,
     rules: Vec<Rule>,
 ) -> Handle {
     let (messages, inbox) = mpsc::channel();
@@ -229,6 +233,7 @@ pub fn spawn_recording(
         pressed_at: None,
         vocabulary_file,
         vocabulary: Vocabulary::default(),
+        fillers,
         rules,
         rule: None,
         last: VecDeque::new(),
@@ -271,6 +276,7 @@ struct Core {
     vocabulary_file: PathBuf,
     /// The vocabulary as read when the current dictation started.
     vocabulary: Vocabulary,
+    fillers: Fillers,
     rules: Vec<Rule>,
     /// The rule that governs the current dictation: chosen when it started, none for the
     /// defaults.
@@ -466,27 +472,32 @@ impl Core {
                 }
             }
             // Corrected where the engine's text comes in: the partial, the final and the paste
-            // all hold the same words.
+            // all hold the same words. The fillers go after the vocabulary, which may have
+            // written a word of its own that the list also names.
             EngineEvent::Partial { utterance, text } => {
                 let utterance = self.utterance(utterance);
-                let text = self.vocabulary.correct(&text);
+                let text = self.fillers.drop(&self.vocabulary.correct(&text));
                 if let Some(text) = self.partial.read(&text) {
                     self.bus.publish(&Event::Partial { utterance, text });
                 }
             }
             EngineEvent::Final { utterance, text } => {
                 let utterance = self.utterance(utterance);
-                let text = self.vocabulary.correct(&text);
+                let text = self.fillers.drop(&self.vocabulary.correct(&text));
                 self.open_utterance = None;
-                if self.last.len() == LAST_PHRASES {
-                    self.last.pop_front();
-                }
-                self.last.push_back(text.clone());
-                if let Some(tally) = &mut self.tally {
-                    tally.words += stats::count_words(&text);
-                }
-                if self.pasting {
-                    self.dictated.push(text.clone());
+                // A phrase of only fillers still closes its utterance in the stream, but it is
+                // not a phrase to keep or to paste.
+                if !text.is_empty() {
+                    if self.last.len() == LAST_PHRASES {
+                        self.last.pop_front();
+                    }
+                    self.last.push_back(text.clone());
+                    if let Some(tally) = &mut self.tally {
+                        tally.words += stats::count_words(&text);
+                    }
+                    if self.pasting {
+                        self.dictated.push(text.clone());
+                    }
                 }
                 self.bus.publish(&Event::Final { utterance, text });
             }
@@ -514,13 +525,9 @@ impl Core {
     /// comes second pastes nothing: the paste happens once.
     fn paste_dictation(&mut self) {
         let finals = std::mem::take(&mut self.dictated);
-        let text = finals
-            .iter()
-            .map(|text| text.trim())
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        // The rule shapes the one text that is pasted; the finals of the stream are left as heard.
+        // The join comes before the rule: `drop_period` then acts on the end of the whole text.
+        // The finals of the stream and of `last` are left as shown.
+        let text = phrases::join(&finals, &self.vocabulary);
         let text = match &self.rule {
             Some(rule) => rule.finish(&text),
             None => text,
