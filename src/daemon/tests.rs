@@ -1,6 +1,7 @@
 use super::*;
 use crate::audio::Capture;
 use crate::engine::{EngineInput, Sink};
+use crate::rules::Rule;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
@@ -304,6 +305,7 @@ fn daemon(mic: FakeMic, engine: FakeEngine) -> (Handle, Arc<FakeMic>, Arc<FakeEn
         HOLD,
         Arc::new(Instant::now),
         no_vocabulary(),
+        Vec::new(),
     );
     (handle, mic, engine)
 }
@@ -354,6 +356,7 @@ fn pasting_daemon(engine: FakeEngine) -> (Handle, FakePaste) {
         HOLD,
         Arc::new(Instant::now),
         no_vocabulary(),
+        Vec::new(),
     );
     (handle, paste)
 }
@@ -414,6 +417,7 @@ fn keyed_daemon(engine: FakeEngine) -> (Handle, FakeClock, Arc<FakeMic>) {
         HOLD,
         clock.clock(),
         no_vocabulary(),
+        Vec::new(),
     );
     (handle, clock, mic)
 }
@@ -429,6 +433,7 @@ fn keyed_pasting_daemon(engine: FakeEngine) -> (Handle, FakeClock, FakePaste) {
         HOLD,
         clock.clock(),
         no_vocabulary(),
+        Vec::new(),
     );
     (handle, clock, paste)
 }
@@ -752,6 +757,7 @@ fn slow_daemon(load: Duration, mic: FakeMic) -> (Handle, Arc<AtomicUsize>, FakeP
         HOLD,
         Arc::new(Instant::now),
         no_vocabulary(),
+        Vec::new(),
     );
     (handle, before_ready, paste)
 }
@@ -1043,6 +1049,7 @@ fn a_press_that_cannot_start_leaves_the_release_without_effect() {
         HOLD,
         clock.clock(),
         no_vocabulary(),
+        Vec::new(),
     );
     assert!(daemon.command(Command::Press).is_err());
     clock.advance(ms(2_000));
@@ -1382,6 +1389,7 @@ fn vocal_daemon(engine: FakeEngine, file: PathBuf) -> (Handle, FakePaste) {
         HOLD,
         Arc::new(Instant::now),
         file,
+        Vec::new(),
     );
     (handle, paste)
 }
@@ -1533,4 +1541,401 @@ fn last_goes_through_the_socket_as_a_list_of_phrases() {
         ask(&path, "last"),
         "{\"phrases\":[\"Bonjour.\",\"Ça va ?\"]}\n"
     );
+}
+
+fn rule(name: &str, class: Option<&str>) -> Rule {
+    Rule {
+        name: name.into(),
+        class: class.map(String::from),
+        paste: true,
+        enter: false,
+        drop_period: false,
+        vocabulary: Vec::new(),
+    }
+}
+
+/// Runs a command in a terminal: the period goes, Enter follows.
+fn terminal() -> Rule {
+    Rule {
+        enter: true,
+        drop_period: true,
+        ..rule("terminal", Some("foot"))
+    }
+}
+
+/// An engine that hears `text` as one phrase and nothing else.
+fn saying(text: &str) -> FakeEngine {
+    FakeEngine {
+        script: vec![(0, EngineEvent::Ready)],
+        on_finish: vec![final_(1, text)],
+        ..FakeEngine::default()
+    }
+}
+
+/// A daemon with `rules`, pasting into `paste`, reading its common vocabulary from `file`.
+fn ruled_daemon(engine: FakeEngine, paste: &FakePaste, rules: Vec<Rule>, file: PathBuf) -> Handle {
+    spawn(
+        Arc::new(FakeMic::default()),
+        Arc::new(engine),
+        Some(Box::new(paste.clone())),
+        HOLD,
+        Arc::new(Instant::now),
+        file,
+        rules,
+    )
+}
+
+/// One dictation, begun by `start` and stopped at once, until the daemon is idle again.
+fn dictate(daemon: &Handle, start: Command) {
+    let watcher = Watcher::on(daemon);
+    daemon.command(start).unwrap();
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Stopping));
+    watcher.skip_to(&state(State::Idle));
+}
+
+fn handed(paste: &FakePaste) -> Vec<Handed> {
+    paste.0.lock().unwrap().clone()
+}
+
+#[test]
+fn a_dictated_command_in_a_terminal_is_run_without_its_period() {
+    let paste = FakePaste::in_window("foot");
+    let daemon = ruled_daemon(saying("ls -la."), &paste, vec![terminal()], no_vocabulary());
+    dictate(&daemon, Command::Start);
+    assert_eq!(
+        handed(&paste),
+        [
+            Handed::Begin,
+            Handed::Phrase("ls -la".into()),
+            Handed::Enter
+        ]
+    );
+}
+
+#[test]
+fn a_window_that_matches_no_rule_gets_the_default_behaviour() {
+    let paste = FakePaste::in_window("org.example.Chat");
+    let daemon = ruled_daemon(saying("ls -la."), &paste, vec![terminal()], no_vocabulary());
+    dictate(&daemon, Command::Start);
+    assert_eq!(
+        handed(&paste),
+        [Handed::Begin, Handed::Phrase("ls -la.".into())]
+    );
+}
+
+#[test]
+fn the_first_matching_rule_governs_the_dictation() {
+    let paste = FakePaste::in_window("foot");
+    let rules = vec![
+        Rule {
+            enter: false,
+            ..terminal()
+        },
+        terminal(),
+    ];
+    let daemon = ruled_daemon(saying("ls -la."), &paste, rules, no_vocabulary());
+    dictate(&daemon, Command::Start);
+    assert_eq!(
+        handed(&paste),
+        [Handed::Begin, Handed::Phrase("ls -la".into())]
+    );
+}
+
+#[test]
+fn enter_alone_sends_a_chat_message_and_keeps_its_period() {
+    let paste = FakePaste::in_window("org.example.Chat");
+    let chat = Rule {
+        enter: true,
+        ..rule("chat", Some("org.example.*"))
+    };
+    let daemon = ruled_daemon(saying("Bonjour."), &paste, vec![chat], no_vocabulary());
+    dictate(&daemon, Command::Start);
+    assert_eq!(
+        handed(&paste),
+        [
+            Handed::Begin,
+            Handed::Phrase("Bonjour.".into()),
+            Handed::Enter
+        ]
+    );
+}
+
+#[test]
+fn only_the_period_that_ends_the_whole_dictation_is_dropped_and_enter_is_pressed_once() {
+    let paste = FakePaste::in_window("foot");
+    let engine = FakeEngine {
+        script: vec![(0, EngineEvent::Ready), (1_600, final_(1, "cd src."))],
+        on_finish: vec![final_(2, "ls.")],
+        ..FakeEngine::default()
+    };
+    let daemon = ruled_daemon(engine, &paste, vec![terminal()], no_vocabulary());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&ev_final(1, "cd src."));
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        handed(&paste),
+        [
+            Handed::Begin,
+            Handed::Phrase("cd src. ls".into()),
+            Handed::Enter
+        ]
+    );
+}
+
+#[test]
+fn the_stream_and_last_keep_the_period_the_rule_drops_from_the_paste() {
+    let paste = FakePaste::in_window("foot");
+    let daemon = ruled_daemon(saying("ls -la."), &paste, vec![terminal()], no_vocabulary());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&ev_final(1, "ls -la."));
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(daemon.last(), ["ls -la."]);
+}
+
+#[test]
+fn a_rule_that_turns_pasting_off_leaves_the_dictation_in_the_stream() {
+    let paste = FakePaste::in_window("org.example.Assistant");
+    let silent = Rule {
+        paste: false,
+        enter: true,
+        ..rule("assistant", Some("org.example.Assistant"))
+    };
+    let daemon = ruled_daemon(saying("Allume."), &paste, vec![silent], no_vocabulary());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&ev_final(1, "Allume."));
+    watcher.skip_to(&state(State::Idle));
+    // Nothing pasted, so no Enter either; the window was only asked its class.
+    assert_eq!(handed(&paste), [Handed::Begin]);
+    assert_eq!(daemon.last(), ["Allume."]);
+}
+
+#[test]
+fn a_dictation_with_no_phrase_presses_no_enter() {
+    let paste = FakePaste::in_window("foot");
+    let daemon = ruled_daemon(ready_engine(), &paste, vec![terminal()], no_vocabulary());
+    dictate(&daemon, Command::Start);
+    assert_eq!(handed(&paste), [Handed::Begin]);
+}
+
+#[test]
+fn a_text_that_is_only_a_dropped_period_presses_no_enter() {
+    let paste = FakePaste::in_window("foot");
+    let daemon = ruled_daemon(saying("."), &paste, vec![terminal()], no_vocabulary());
+    dictate(&daemon, Command::Start);
+    assert_eq!(handed(&paste), [Handed::Begin]);
+}
+
+#[test]
+fn the_rule_is_chosen_from_the_window_where_the_dictation_started() {
+    let paste = FakePaste::in_window("foot");
+    let daemon = ruled_daemon(saying("ls -la."), &paste, vec![terminal()], no_vocabulary());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    // The focus moves to a chat before the stop: the terminal rule still governs.
+    *paste.1.lock().unwrap() = Some("org.example.Chat".into());
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Stopping));
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        handed(&paste),
+        [
+            Handed::Begin,
+            Handed::Phrase("ls -la".into()),
+            Handed::Enter
+        ]
+    );
+}
+
+#[test]
+fn each_dictation_chooses_its_rule_again() {
+    let paste = FakePaste::in_window("foot");
+    let daemon = ruled_daemon(saying("ls."), &paste, vec![terminal()], no_vocabulary());
+    dictate(&daemon, Command::Start);
+    *paste.1.lock().unwrap() = Some("org.example.Chat".into());
+    dictate(&daemon, Command::Start);
+    assert_eq!(
+        handed(&paste),
+        [
+            Handed::Begin,
+            Handed::Phrase("ls".into()),
+            Handed::Enter,
+            Handed::Begin,
+            Handed::Phrase("ls.".into()),
+        ]
+    );
+}
+
+#[test]
+fn a_dictation_that_does_not_paste_asks_no_window_and_runs_no_rule() {
+    let paste = FakePaste::in_window("foot");
+    let daemon = ruled_daemon(saying("ls."), &paste, vec![terminal()], no_vocabulary());
+    dictate(&daemon, Command::StartNoPaste);
+    assert_eq!(handed(&paste), []);
+}
+
+#[test]
+fn start_with_a_rule_forces_it_whatever_the_window() {
+    let paste = FakePaste::in_window("org.example.Chat");
+    let daemon = ruled_daemon(saying("ls -la."), &paste, vec![terminal()], no_vocabulary());
+    dictate(&daemon, Command::StartRule("terminal".into()));
+    assert_eq!(
+        handed(&paste),
+        [
+            Handed::Begin,
+            Handed::Phrase("ls -la".into()),
+            Handed::Enter
+        ]
+    );
+}
+
+#[test]
+fn a_rule_without_a_class_is_reached_by_its_name_only() {
+    let paste = FakePaste::in_window("foot");
+    let shell = Rule {
+        enter: true,
+        ..rule("shell", None)
+    };
+    let daemon = ruled_daemon(saying("ls."), &paste, vec![shell], no_vocabulary());
+    dictate(&daemon, Command::Start);
+    assert_eq!(
+        handed(&paste),
+        [Handed::Begin, Handed::Phrase("ls.".into())]
+    );
+    dictate(&daemon, Command::StartRule("shell".into()));
+    assert_eq!(
+        handed(&paste)[2..],
+        [Handed::Begin, Handed::Phrase("ls.".into()), Handed::Enter]
+    );
+}
+
+#[test]
+fn a_forced_rule_governs_one_dictation_only() {
+    let paste = FakePaste::in_window("org.example.Chat");
+    let daemon = ruled_daemon(saying("ls."), &paste, vec![terminal()], no_vocabulary());
+    dictate(&daemon, Command::StartRule("terminal".into()));
+    dictate(&daemon, Command::Start);
+    assert_eq!(
+        handed(&paste)[3..],
+        [Handed::Begin, Handed::Phrase("ls.".into())]
+    );
+}
+
+#[test]
+fn a_key_pressed_with_a_rule_forces_it_for_the_dictation_it_starts() {
+    let clock = FakeClock::new();
+    let paste = FakePaste::in_window("org.example.Chat");
+    let daemon = spawn(
+        Arc::new(FakeMic::default()),
+        Arc::new(saying("ls -la.")),
+        Some(Box::new(paste.clone())),
+        HOLD,
+        clock.clock(),
+        no_vocabulary(),
+        vec![terminal()],
+    );
+    let watcher = Watcher::on(&daemon);
+    assert_eq!(
+        daemon.command(Command::PressRule("terminal".into())),
+        Ok(State::Loading)
+    );
+    clock.advance(ms(500));
+    assert_eq!(daemon.command(Command::Release), Ok(State::Stopping));
+    watcher.skip_to(&state(State::Stopping));
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        handed(&paste),
+        [
+            Handed::Begin,
+            Handed::Phrase("ls -la".into()),
+            Handed::Enter
+        ]
+    );
+}
+
+#[test]
+fn an_unknown_rule_refuses_the_start_before_the_microphone_opens() {
+    let mic = Arc::new(FakeMic::default());
+    let paste = FakePaste::in_window("foot");
+    let daemon = spawn(
+        mic.clone(),
+        Arc::new(ready_engine()),
+        Some(Box::new(paste.clone())),
+        HOLD,
+        Arc::new(Instant::now),
+        no_vocabulary(),
+        vec![terminal()],
+    );
+    let watcher = Watcher::on(&daemon);
+    for command in [
+        Command::StartRule("nope".into()),
+        Command::PressRule("nope".into()),
+    ] {
+        let error = daemon.command(command).unwrap_err();
+        assert!(error.contains("nope"), "{error}");
+    }
+    assert_eq!(daemon.command(Command::Status), Ok(State::Idle));
+    assert_eq!(mic.opened.load(Ordering::SeqCst), 0);
+    assert_eq!(handed(&paste), []);
+    watcher.skip_to(&Event::Error {
+        message: "no rule is named nope".into(),
+    });
+}
+
+/// A common vocabulary of one entry, in its own file.
+fn common_vocabulary(name: &str, line: &str) -> PathBuf {
+    let file = vocabulary_file(name);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, format!("{line}\n")).unwrap();
+    file
+}
+
+#[test]
+fn a_rule_adds_its_vocabulary_to_the_common_one_for_its_dictations_only() {
+    let file = common_vocabulary("rule-adds", "foo bar -> Foobar");
+    let paste = FakePaste::in_window("foot");
+    let own = Rule {
+        vocabulary: vec!["baz -> Baz".into()],
+        ..terminal()
+    };
+    let engine = FakeEngine {
+        script: vec![(0, EngineEvent::Ready), (1_600, partial(1, "foo bar baz"))],
+        on_finish: vec![final_(1, "foo bar baz.")],
+        ..FakeEngine::default()
+    };
+    let daemon = ruled_daemon(engine, &paste, vec![own], file);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&ev_partial(1, "Foobar Baz"));
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&ev_final(1, "Foobar Baz."));
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(handed(&paste)[1], Handed::Phrase("Foobar Baz".into()));
+
+    // A window with no rule: the common vocabulary alone.
+    *paste.1.lock().unwrap() = Some("org.example.Chat".into());
+    daemon.command(Command::Start).unwrap();
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&ev_final(2, "Foobar baz."));
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(handed(&paste)[4], Handed::Phrase("Foobar baz.".into()));
+}
+
+#[test]
+fn on_the_same_heard_words_the_rule_vocabulary_wins_over_the_common_one() {
+    let file = common_vocabulary("rule-wins", "foo bar -> Foobar");
+    let paste = FakePaste::in_window("foot");
+    let own = Rule {
+        vocabulary: vec!["foo bar -> foo_bar".into()],
+        ..terminal()
+    };
+    let daemon = ruled_daemon(saying("ouvre foo bar."), &paste, vec![own], file);
+    dictate(&daemon, Command::Start);
+    assert_eq!(handed(&paste)[1], Handed::Phrase("ouvre foo_bar".into()));
 }

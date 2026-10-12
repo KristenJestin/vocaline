@@ -9,6 +9,7 @@ use crate::audio::{Capture, Microphone, SAMPLE_RATE, rms};
 use crate::engine::{Engine, EngineEvent, EngineInput};
 use crate::events::{Event, State, VERSION};
 use crate::output::Paste;
+use crate::rules::{self, Rule};
 use crate::steady::Steady;
 use crate::vocabulary::Vocabulary;
 use serde::{Deserialize, Serialize};
@@ -28,13 +29,17 @@ const WATCHER_TIMEOUT: Duration = Duration::from_secs(1);
 /// How many final phrases `last` can show.
 const LAST_PHRASES: usize = 20;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// The key went down: stop when listening, otherwise start and remember when.
     Press,
+    /// `Press`, and if it starts a dictation, the rule of that name governs it.
+    PressRule(String),
     /// The key went up: stop if it was held long enough.
     Release,
     Start,
+    /// Start, with the rule of that name governing the dictation whatever the window.
+    StartRule(String),
     /// Start, with nothing pasted: for a program that only reads the stream.
     StartNoPaste,
     Stop,
@@ -43,7 +48,26 @@ pub enum Command {
 }
 
 impl Command {
+    /// The rule the command forces.
+    fn rule(&self) -> Option<&str> {
+        match self {
+            Command::PressRule(name) | Command::StartRule(name) => Some(name),
+            _ => None,
+        }
+    }
+
     pub fn parse(word: &str) -> Option<Command> {
+        let named = |prefix: &str| {
+            word.strip_prefix(prefix)
+                .filter(|name| !name.is_empty() && !name.contains(char::is_whitespace))
+                .map(String::from)
+        };
+        if let Some(name) = named("start --rule ") {
+            return Some(Command::StartRule(name));
+        }
+        if let Some(name) = named("press --rule ") {
+            return Some(Command::PressRule(name));
+        }
         match word {
             "press" => Some(Command::Press),
             "release" => Some(Command::Release),
@@ -56,15 +80,17 @@ impl Command {
         }
     }
 
-    pub fn word(self) -> &'static str {
+    pub fn word(&self) -> String {
         match self {
-            Command::Press => "press",
-            Command::Release => "release",
-            Command::Start => "start",
-            Command::StartNoPaste => "start --no-paste",
-            Command::Stop => "stop",
-            Command::Toggle => "toggle",
-            Command::Status => "status",
+            Command::Press => "press".into(),
+            Command::PressRule(name) => format!("press --rule {name}"),
+            Command::Release => "release".into(),
+            Command::Start => "start".into(),
+            Command::StartRule(name) => format!("start --rule {name}"),
+            Command::StartNoPaste => "start --no-paste".into(),
+            Command::Stop => "stop".into(),
+            Command::Toggle => "toggle".into(),
+            Command::Status => "status".into(),
         }
     }
 }
@@ -145,7 +171,8 @@ pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 /// Starts the daemon's thread. The finals of a dictation go to `paste`, if any, in one piece
 /// once it has stopped. A key held for `hold` or more stops the dictation it started when it
 /// is released. The vocabulary file is read again at each start, so a `teach` or an edit by
-/// hand applies to the next dictation.
+/// hand applies to the next dictation. The first of `rules` that matches the window the
+/// dictation starts in governs it.
 pub fn spawn(
     mic: Arc<dyn Microphone>,
     engine: Arc<dyn Engine>,
@@ -153,6 +180,7 @@ pub fn spawn(
     hold: Duration,
     clock: Clock,
     vocabulary_file: PathBuf,
+    rules: Vec<Rule>,
 ) -> Handle {
     let (messages, inbox) = mpsc::channel();
     let mut core = Core {
@@ -174,6 +202,8 @@ pub fn spawn(
         pressed_at: None,
         vocabulary_file,
         vocabulary: Vocabulary::default(),
+        rules,
+        rule: None,
         last: VecDeque::new(),
     };
     thread::spawn(move || {
@@ -211,6 +241,10 @@ struct Core {
     vocabulary_file: PathBuf,
     /// The vocabulary as read when the current dictation started.
     vocabulary: Vocabulary,
+    rules: Vec<Rule>,
+    /// The rule that governs the current dictation: chosen when it started, none for the
+    /// defaults.
+    rule: Option<Rule>,
     /// The last finals, as shown; in memory only, for `last`.
     last: VecDeque<String>,
 }
@@ -247,20 +281,20 @@ impl Core {
     }
 
     fn command(&mut self, command: Command) -> Reply {
-        match (command, self.state) {
+        match (&command, self.state) {
             (Command::Status, state) => Ok(state),
-            (Command::Press, State::Idle) => {
-                let reply = self.start(true);
+            (Command::Press | Command::PressRule(_), State::Idle) => {
+                let reply = self.start(true, command.rule());
                 if reply.is_ok() {
                     self.pressed_at = Some((self.clock)());
                 }
                 reply
             }
-            (Command::Press, State::Stopping) => {
+            (Command::Press | Command::PressRule(_), State::Stopping) => {
                 self.pressed_at = None;
                 Err("still stopping the last dictation, try again".into())
             }
-            (Command::Press, State::Loading | State::Listening) => {
+            (Command::Press | Command::PressRule(_), State::Loading | State::Listening) => {
                 self.pressed_at = None;
                 self.command(Command::Stop)
             }
@@ -275,15 +309,18 @@ impl Core {
                 }
                 _ => Ok(state),
             },
-            (Command::Start | Command::Toggle, State::Idle) => self.start(true),
-            (Command::StartNoPaste, State::Idle) => self.start(false),
+            (Command::Start | Command::StartRule(_) | Command::Toggle, State::Idle) => {
+                self.start(true, command.rule())
+            }
+            (Command::StartNoPaste, State::Idle) => self.start(false, None),
             (
-                Command::Start | Command::StartNoPaste,
+                Command::Start | Command::StartRule(_) | Command::StartNoPaste,
                 state @ (State::Loading | State::Listening),
             ) => Ok(state),
-            (Command::Start | Command::StartNoPaste | Command::Toggle, State::Stopping) => {
-                Err("still stopping the last dictation, try again".into())
-            }
+            (
+                Command::Start | Command::StartRule(_) | Command::StartNoPaste | Command::Toggle,
+                State::Stopping,
+            ) => Err("still stopping the last dictation, try again".into()),
             (Command::Stop | Command::Toggle, State::Loading | State::Listening) => {
                 self.stop.store(true, Ordering::SeqCst);
                 self.set(State::Stopping);
@@ -293,7 +330,16 @@ impl Core {
         }
     }
 
-    fn start(&mut self, paste: bool) -> Reply {
+    fn start(&mut self, paste: bool, forced: Option<&str>) -> Reply {
+        // Before anything is opened: a rule that does not exist is a typo to tell, not a
+        // dictation to run with the defaults.
+        let forced = forced
+            .map(|name| {
+                rules::named(&self.rules, name)
+                    .cloned()
+                    .ok_or_else(|| self.failed(format!("no rule is named {name}")))
+            })
+            .transpose()?;
         // The microphone first: if it cannot open, no model is loaded for nothing.
         let capture = self
             .mic
@@ -322,21 +368,27 @@ impl Core {
             dictation,
         };
         thread::spawn(move || pump.run());
-        self.pasting = paste && self.paste.is_some();
+        // The window is asked once, where the dictation starts: the rule follows it there, not
+        // to where the focus is at the stop. A dictation that pastes nothing has no use for a
+        // window rule.
+        let paste = if paste { self.paste.as_ref() } else { None };
+        let class = paste.and_then(|output| output.begin());
+        self.rule = forced.or_else(|| rules::select(&self.rules, class.as_deref()).cloned());
+        self.pasting = paste.is_some() && self.rule.as_ref().is_none_or(|rule| rule.paste);
         self.dictated.clear();
         self.read_vocabulary();
-        if self.pasting
-            && let Some(output) = &self.paste
-        {
-            output.begin();
-        }
         self.set(State::Loading);
         Ok(State::Loading)
     }
 
     /// A `teach` or an edit by hand is read from the next dictation on, not in the middle of one.
     fn read_vocabulary(&mut self) {
-        let (vocabulary, problems) = Vocabulary::load(&self.vocabulary_file);
+        let (mut vocabulary, mut problems) = Vocabulary::load(&self.vocabulary_file);
+        if let Some(rule) = &self.rule {
+            let (own, own_problems) = rule.vocabulary();
+            vocabulary = vocabulary.with(&own);
+            problems.extend(own_problems);
+        }
         self.vocabulary = vocabulary;
         if !problems.is_empty() {
             self.bus.publish(&Event::Error {
@@ -411,10 +463,18 @@ impl Core {
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
+        // The rule shapes the one text that is pasted; the finals of the stream are left as heard.
+        let text = match &self.rule {
+            Some(rule) => rule.finish(&text),
+            None => text,
+        };
         if !text.is_empty()
             && let Some(output) = &self.paste
         {
             output.phrase(text);
+            if self.rule.as_ref().is_some_and(|rule| rule.enter) {
+                output.enter();
+            }
         }
     }
 

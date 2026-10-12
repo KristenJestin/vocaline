@@ -43,7 +43,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Cli::Help => println!("{}", cli::USAGE),
         Cli::Daemon { audio_file } => run_daemon(&dirs, audio_file.as_deref())?,
         Cli::Command(command) => {
-            println!("{}", cli::request(&dirs.socket(), command.word())?.name());
+            println!("{}", cli::request(&dirs.socket(), &command.word())?.name());
         }
         Cli::Last => {
             for phrase in cli::last(&dirs.socket())? {
@@ -89,6 +89,7 @@ fn run_daemon(dirs: &Dirs, audio_file: Option<&Path>) -> Result<(), String> {
             hold,
             Arc::new(Instant::now),
             dirs.vocabulary_file(),
+            config.rule,
         ),
     );
     Ok(())
