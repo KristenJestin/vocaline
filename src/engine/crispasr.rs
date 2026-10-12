@@ -9,12 +9,16 @@ use crate::config::{Backend, EngineConfig};
 use serde::Deserialize;
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 /// Lines of the engine's diagnostics kept to explain a failure; the rest is dropped.
-const KEPT_DIAGNOSTICS: usize = 12;
+const KEPT_DIAGNOSTICS: usize = 5;
+
+/// Bytes of them that go into the event: it reaches every watcher, and a log.
+const KEPT_BYTES: usize = 400;
 
 pub struct CrispAsr {
     config: EngineConfig,
@@ -63,6 +67,28 @@ impl CrispAsr {
 }
 
 impl Engine for CrispAsr {
+    /// The files the configuration names, unless the VAD model is left to crispasr. Read from
+    /// the disk at each call: `vocaline setup` may have fetched one since the daemon started.
+    fn check(&self) -> Result<(), String> {
+        let c = &self.config;
+        let vad_model = Path::new(&c.vad_model);
+        let vad_model = (c.vad_model != "auto").then_some(vad_model);
+        for (what, file) in [("model", Some(c.model.as_path())), ("VAD model", vad_model)] {
+            let Some(file) = file else { continue };
+            match std::fs::metadata(file) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return Err(format!(
+                        "the {what} file {} is missing: `vocaline setup` fetches it",
+                        file.display()
+                    ));
+                }
+                Err(e) => return Err(format!("the {what} file {}: {e}", file.display())),
+            }
+        }
+        Ok(())
+    }
+
     fn open(&self, sink: Sink) -> io::Result<Box<dyn EngineInput>> {
         let mut child = self
             .command()
@@ -110,7 +136,7 @@ impl Engine for CrispAsr {
                     let last: Vec<&str> = kept.iter().map(String::as_str).collect();
                     Err(format!(
                         "the engine stopped ({status}): {}",
-                        last.join(" | ")
+                        tail(&last.join(" | "))
                     ))
                 }
                 Err(e) => Err(format!("the engine could not be awaited: {e}")),
@@ -119,6 +145,18 @@ impl Engine for CrispAsr {
         });
         Ok(Box::new(Input { stdin }))
     }
+}
+
+/// The end of `text`, at most `KEPT_BYTES` long, cut on a character: where a process says why
+/// it stopped.
+fn tail(text: &str) -> String {
+    let Some(mut from) = text.len().checked_sub(KEPT_BYTES) else {
+        return text.into();
+    };
+    while !text.is_char_boundary(from) {
+        from += 1;
+    }
+    format!("…{}", &text[from..])
 }
 
 struct Input {
@@ -426,6 +464,25 @@ mod tests {
             panic!("{events:?}");
         };
         assert!(message.contains("model not found"), "{message}");
+    }
+
+    // The tail goes into an event every watcher reads: a few lines, a few hundred bytes, the
+    // end of them since that is where a process says why it stopped.
+    #[test]
+    fn the_diagnostics_of_a_failing_engine_are_a_short_tail() {
+        let script = r#"
+            cat >/dev/null
+            for i in $(seq 1 40); do echo "line $i: $(printf 'x%.0s' $(seq 1 100))" >&2; done
+            echo 'error: the end, é' >&2
+            exit 3
+        "#;
+        let events = run("long-tail", script, &[0; 16]);
+        let [EngineEvent::Ended(Err(message))] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert!(message.ends_with("error: the end, é"), "{message}");
+        assert!(!message.contains("line 1:"), "{message}");
+        assert!(message.len() <= 500, "{} bytes: {message}", message.len());
     }
 
     #[test]

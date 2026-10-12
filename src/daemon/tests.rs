@@ -2552,3 +2552,136 @@ fn a_rule_drops_the_period_of_the_text_once_joined() {
         ]
     );
 }
+
+/// The real engine driver on a configuration whose files are in a folder of the test: the
+/// check of the files happens before any process, so nothing is loaded.
+mod model_files {
+    use super::*;
+    use crate::config::EngineConfig;
+    use crate::engine::CrispAsr;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn folder(name: &str) -> PathBuf {
+        let folder =
+            std::env::temp_dir().join(format!("vocaline-models-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        folder
+    }
+
+    fn engine_config(folder: &Path, model: bool, vad_model: bool) -> EngineConfig {
+        let model_file = folder.join("parakeet.gguf");
+        let vad_file = folder.join("ggml-silero.bin");
+        for (present, file) in [(model, &model_file), (vad_model, &vad_file)] {
+            if present {
+                std::fs::write(file, b"not a real model").unwrap();
+            }
+        }
+        EngineConfig {
+            model: model_file,
+            vad_model: vad_file.to_string_lossy().into_owned(),
+            ..EngineConfig::default()
+        }
+    }
+
+    fn real_engine_daemon(config: EngineConfig) -> (Handle, Arc<FakeMic>) {
+        let mic = Arc::new(FakeMic::default());
+        let handle = spawn(
+            mic.clone(),
+            Arc::new(CrispAsr::new(config)),
+            None,
+            HOLD,
+            Arc::new(Instant::now),
+            no_vocabulary(),
+            Vec::new(),
+        );
+        (handle, mic)
+    }
+
+    fn start_refused_naming(config: EngineConfig, file: &Path) {
+        let (daemon, mic) = real_engine_daemon(config);
+        let watcher = Watcher::on(&daemon);
+        watcher.expect(&[Event::Hello { version: 1 }, state(State::Idle)]);
+        let error = daemon.command(Command::Start).unwrap_err();
+        assert!(error.contains(&file.display().to_string()), "{error}");
+        assert!(error.contains("vocaline setup"), "{error}");
+        assert_eq!(watcher.next(), Event::Error { message: error });
+        assert_eq!(daemon.command(Command::Status), Ok(State::Idle));
+        assert_eq!(mic.opened.load(Ordering::SeqCst), 0, "no microphone opened");
+    }
+
+    #[test]
+    fn a_missing_vad_model_is_an_error_not_a_silent_stop() {
+        let folder = folder("vad");
+        let config = engine_config(&folder, true, false);
+        let vad = PathBuf::from(&config.vad_model);
+        start_refused_naming(config, &vad);
+    }
+
+    #[test]
+    fn a_missing_model_is_an_error_not_a_silent_stop() {
+        let folder = folder("model");
+        let config = engine_config(&folder, false, true);
+        let model = config.model.clone();
+        start_refused_naming(config, &model);
+    }
+
+    #[test]
+    fn a_vad_model_left_to_crispasr_is_not_looked_for() {
+        let folder = folder("auto");
+        let mut config = engine_config(&folder, true, false);
+        config.vad_model = "auto".into();
+        // The command does not exist: past the check, the start fails on the process itself.
+        config.command = "/nonexistent/crispasr".into();
+        let (daemon, _) = real_engine_daemon(config);
+        let error = daemon.command(Command::Start).unwrap_err();
+        assert!(error.contains("the engine could not start"), "{error}");
+    }
+
+    #[test]
+    fn a_model_that_appears_while_the_daemon_runs_is_found_at_the_next_start() {
+        let folder = folder("later");
+        let config = engine_config(&folder, true, false);
+        let vad = PathBuf::from(&config.vad_model);
+        let (daemon, _) = real_engine_daemon(config);
+        assert!(daemon.command(Command::Start).is_err());
+        std::fs::write(&vad, b"fetched by vocaline setup").unwrap();
+        // Past the check, the start meets the engine, which is not installed here.
+        let error = daemon.command(Command::Start).unwrap_err();
+        assert!(error.contains("the engine could not start"), "{error}");
+    }
+
+    #[test]
+    fn an_engine_that_fails_says_why() {
+        let folder = folder("fails");
+        let mut config = engine_config(&folder, true, true);
+        let script = folder.join("crispasr");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'error: cannot load the model: invalid magic' >&2\nexit 3\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        config.command = script;
+        let (daemon, _) = real_engine_daemon(config);
+        let watcher = Watcher::on(&daemon);
+        // A process forked by another test while the script was still open for writing makes
+        // the kernel refuse to run it for a moment (ETXTBSY): the start is tried again.
+        let deadline = Instant::now() + WAIT;
+        while let Err(e) = daemon.command(Command::Start) {
+            assert!(e.contains("busy") && Instant::now() < deadline, "{e}");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let message = loop {
+            match watcher.next() {
+                Event::Error { message } if message.contains("the engine stopped") => {
+                    break message;
+                }
+                _ => {}
+            }
+        };
+        assert!(message.contains("invalid magic"), "{message}");
+        watcher.skip_to(&state(State::Idle));
+        assert_eq!(daemon.command(Command::Status), Ok(State::Idle));
+    }
+}

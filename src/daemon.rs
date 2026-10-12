@@ -389,6 +389,9 @@ impl Core {
                     .ok_or_else(|| self.failed(format!("no rule is named {name}")))
             })
             .transpose()?;
+        // Before the microphone opens: a model file that is not there stops the engine within
+        // milliseconds and leaves nothing to tell why.
+        self.engine.check().map_err(|e| self.failed(e))?;
         // The microphone first: if it cannot open, no model is loaded for nothing.
         let capture = self
             .mic
