@@ -1,5 +1,6 @@
 //! What differs between machines: the engine binary, the model, the backend, the cadence.
 
+use crate::rules::{self, Rule};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -62,6 +63,8 @@ pub struct Config {
     pub engine: EngineConfig,
     pub key: KeyConfig,
     pub output: OutputConfig,
+    /// What a dictation does depending on its window, first match wins (see `rules`).
+    pub rule: Vec<Rule>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -163,6 +166,7 @@ impl Config {
             config.engine.vad_model = vad.to_string_lossy().into_owned();
         }
         config.engine.command = expand_home(&config.engine.command);
+        rules::check(&config.rule)?;
         Ok(config)
     }
 }
@@ -248,6 +252,49 @@ mod tests {
             engine.model,
             PathBuf::from("/data/vocaline/models/other.gguf")
         );
+    }
+
+    #[test]
+    fn there_is_no_rule_by_default() {
+        assert!(Config::parse("", &dirs()).unwrap().rule.is_empty());
+    }
+
+    #[test]
+    fn rules_are_read_in_the_order_of_the_file() {
+        let text = r#"
+            [[rule]]
+            name = "terminal"
+            class = "foot"
+            enter = true
+            drop_period = true
+
+            [[rule]]
+            name = "chat"
+            class = "org.example.*"
+            enter = true
+            vocabulary = ["foo bar -> Foobar"]
+
+            [[rule]]
+            name = "silent"
+            paste = false
+        "#;
+        let rules = Config::parse(text, &dirs()).unwrap().rule;
+        let names: Vec<_> = rules.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["terminal", "chat", "silent"]);
+        assert!(rules[0].paste && rules[0].enter && rules[0].drop_period);
+        assert_eq!(rules[1].class.as_deref(), Some("org.example.*"));
+        assert_eq!(rules[1].vocabulary, ["foo bar -> Foobar"]);
+        assert!(!rules[2].paste && rules[2].class.is_none());
+    }
+
+    #[test]
+    fn a_rule_with_an_unknown_key_or_a_bad_vocabulary_is_an_error() {
+        let error = Config::parse("[[rule]]\nname = \"a\"\nenter_twice = true", &dirs());
+        assert!(error.unwrap_err().contains("enter_twice"));
+        let text = "[[rule]]\nname = \"a\"\nvocabulary = [\"no arrow\"]";
+        assert!(Config::parse(text, &dirs()).unwrap_err().contains("rule a"));
+        let text = "[[rule]]\nname = \"a\"\n[[rule]]\nname = \"a\"";
+        assert!(Config::parse(text, &dirs()).is_err());
     }
 
     #[test]

@@ -18,10 +18,13 @@ usage: vocaline <command>
 
   daemon [--audio-file <wav>]  own the microphone and the engine; with --audio-file, each
                                dictation plays that 16 kHz mono recording instead
-  press                        the key went down: stop when listening, otherwise start
+  press [--rule <name>]        the key went down: stop when listening, otherwise start; with
+                               --rule, the rule of that name governs the dictation it starts
   release                      the key went up: stop if it was held long enough (hold-to-talk)
-  start [--no-paste]           start listening; with --no-paste, the final phrases are only
-                               in the event stream, nothing is pasted
+  start [--no-paste | --rule <name>]
+                               start listening; with --no-paste, the final phrases are only
+                               in the event stream, nothing is pasted; with --rule, the rule
+                               of that name governs the dictation, whatever the window
   stop                         stop listening; the open phrase is finalised
   toggle                       start, or stop
   status                       print the state: idle, loading, listening or stopping
@@ -54,6 +57,11 @@ impl Cli {
                 audio_file: Some(PathBuf::from(path)),
             }),
             ["start", "--no-paste"] => Ok(Cli::Command(Command::StartNoPaste)),
+            [verb @ ("start" | "press"), "--rule", name] => {
+                Command::parse(&format!("{verb} --rule {name}"))
+                    .map(Cli::Command)
+                    .ok_or_else(|| format!("a rule name is one word, not {name:?}"))
+            }
             ["watch"] => Ok(Cli::Watch),
             ["last"] => Ok(Cli::Last),
             ["teach", heard, wanted] => Ok(Cli::Teach {
@@ -181,6 +189,14 @@ mod tests {
             Cli::parse(&args(&["start", "--no-paste"])),
             Ok(Cli::Command(Command::StartNoPaste))
         );
+        assert_eq!(
+            Cli::parse(&args(&["start", "--rule", "terminal"])),
+            Ok(Cli::Command(Command::StartRule("terminal".into())))
+        );
+        assert_eq!(
+            Cli::parse(&args(&["press", "--rule", "chat"])),
+            Ok(Cli::Command(Command::PressRule("chat".into())))
+        );
         assert_eq!(Cli::parse(&args(&["watch"])), Ok(Cli::Watch));
         assert_eq!(Cli::parse(&args(&["setup"])), Ok(Cli::Setup));
         assert_eq!(Cli::parse(&args(&["--help"])), Ok(Cli::Help));
@@ -209,6 +225,12 @@ mod tests {
         assert!(Cli::parse(&args(&["dance"])).is_err());
         assert!(Cli::parse(&args(&["start", "now"])).is_err());
         assert!(Cli::parse(&args(&["daemon", "--audio-file"])).is_err());
+        assert!(Cli::parse(&args(&["start", "--rule"])).is_err());
+        assert!(Cli::parse(&args(&["start", "--rule", ""])).is_err());
+        assert!(Cli::parse(&args(&["start", "--rule", "two words"])).is_err());
+        assert!(Cli::parse(&args(&["start", "--rule", "a", "--no-paste"])).is_err());
+        assert!(Cli::parse(&args(&["release", "--rule", "a"])).is_err());
+        assert!(Cli::parse(&args(&["toggle", "--rule", "a"])).is_err());
         assert!(Cli::parse(&args(&["last", "now"])).is_err());
         assert!(Cli::parse(&args(&["teach"])).is_err());
         assert!(Cli::parse(&args(&["teach", "foo bar"])).is_err());
@@ -230,6 +252,27 @@ mod tests {
             line
         });
         (path, asked)
+    }
+
+    #[test]
+    fn a_command_is_sent_as_the_word_the_daemon_parses() {
+        for command in [
+            Command::StartRule("terminal".into()),
+            Command::PressRule("chat".into()),
+            Command::Start,
+            Command::StartNoPaste,
+            Command::Release,
+        ] {
+            assert_eq!(Command::parse(&command.word()), Some(command));
+        }
+    }
+
+    #[test]
+    fn a_rule_is_sent_to_the_daemon_on_the_command_line() {
+        let (path, asked) = one_answer("rule.sock", "{\"state\":\"loading\"}\n");
+        let command = Command::StartRule("terminal".into());
+        assert_eq!(request(&path, &command.word()), Ok(State::Loading));
+        assert_eq!(asked.join().unwrap(), "start --rule terminal\n");
     }
 
     #[test]

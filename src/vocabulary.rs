@@ -67,6 +67,17 @@ impl Vocabulary {
         (Vocabulary { entries }, problems)
     }
 
+    /// This vocabulary with `other` on top: on the same heard words, `other` wins.
+    pub fn with(mut self, other: &Vocabulary) -> Vocabulary {
+        for entry in &other.entries {
+            self.entries.retain(|known| known.heard != entry.heard);
+            self.entries.push(entry.clone());
+        }
+        self.entries
+            .sort_by_key(|entry| std::cmp::Reverse(entry.heard.len()));
+        self
+    }
+
     /// The text with every heard entry replaced by the way it must be written.
     pub fn correct(&self, text: &str) -> String {
         if self.entries.is_empty() {
@@ -242,6 +253,17 @@ mod tests {
         let v = vocabulary("foo bar baz -> FooBarBaz");
         assert_eq!(v.correct("un foo  bar\tbaz ici"), "un FooBarBaz ici");
         assert_eq!(v.correct("foo bar"), "foo bar");
+    }
+
+    #[test]
+    fn a_vocabulary_on_top_of_another_adds_to_it_and_wins_on_the_same_words() {
+        let common = vocabulary("foo bar -> Foobar\nélodie -> Elodie");
+        let own = vocabulary("baz -> Baz\nfoo bar -> FOOBAR");
+        let both = common.with(&own);
+        assert_eq!(
+            both.correct("foo bar, baz et élodie"),
+            "FOOBAR, Baz et Elodie"
+        );
     }
 
     #[test]

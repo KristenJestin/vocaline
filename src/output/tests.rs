@@ -16,15 +16,26 @@ enum Did {
 }
 
 #[derive(Default)]
-struct Log(Mutex<Vec<Did>>);
+struct Log(Mutex<Vec<(Instant, Did)>>);
 
 impl Log {
     fn push(&self, did: Did) {
-        self.0.lock().unwrap().push(did);
+        self.0.lock().unwrap().push((Instant::now(), did));
     }
 
     fn all(&self) -> Vec<Did> {
-        self.0.lock().unwrap().clone()
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, d)| d.clone())
+            .collect()
+    }
+
+    /// When the fakes saw the first `did`.
+    fn when(&self, did: &Did) -> Instant {
+        let seen = self.0.lock().unwrap();
+        seen.iter().find(|(_, d)| d == did).expect("it happened").0
     }
 
     fn wait_for(&self, count: usize) -> Vec<Did> {
@@ -352,4 +363,88 @@ fn the_shortcut_is_typed_by_wtype() {
             "-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl"
         ]
     );
+}
+
+#[test]
+fn the_shortcut_for_enter_is_the_return_key() {
+    assert_eq!(Wtype::args(Shortcut::Enter), ["-k", "Return"]);
+}
+
+#[test]
+fn beginning_a_dictation_tells_the_class_of_the_window_that_has_the_focus() {
+    let s = setup();
+    assert_eq!(s.output.begin(), Some("org.gnome.TextEditor".into()));
+    s.click(TERMINAL);
+    assert_eq!(s.output.begin(), Some("foot".into()));
+    *s.desktop.focused.lock().unwrap() = None;
+    assert_eq!(s.output.begin(), None);
+}
+
+#[test]
+fn enter_is_pressed_once_after_the_paste() {
+    let s = setup();
+    s.begin();
+    s.output.phrase("ls -la".into());
+    s.output.enter();
+    assert_eq!(
+        s.log.wait_for(5),
+        [
+            Did::Save,
+            Did::Set("ls -la".into()),
+            Did::Press(Shortcut::CtrlV),
+            Did::Press(Shortcut::Enter),
+            Did::Restore(screenshot()),
+        ]
+    );
+}
+
+#[test]
+fn enter_waits_for_the_application_to_read_the_clipboard() {
+    let s = setup();
+    s.begin();
+    s.output.phrase("ls -la".into());
+    s.output.enter();
+    s.log.wait_for(5);
+    let gap = s.log.when(&Did::Press(Shortcut::Enter)) - s.log.when(&Did::Press(Shortcut::CtrlV));
+    // The settle of the test setup: Enter sooner would run the line before it is pasted.
+    assert!(gap >= Duration::from_millis(25), "{gap:?}");
+}
+
+#[test]
+fn enter_waits_until_the_modifier_is_released() {
+    let s = setup();
+    s.begin();
+    s.output.phrase("ls".into());
+    s.log.wait_for(3);
+    s.desktop.modifier.store(true, Ordering::SeqCst);
+    s.output.enter();
+    thread::sleep(Duration::from_millis(100));
+    assert!(!s.log.all().contains(&Did::Press(Shortcut::Enter)));
+    s.desktop.modifier.store(false, Ordering::SeqCst);
+    s.log.wait_for(4);
+    assert_eq!(s.log.all()[3], Did::Press(Shortcut::Enter));
+}
+
+#[test]
+fn enter_goes_to_the_window_of_the_dictation() {
+    let s = setup();
+    s.begin();
+    s.output.phrase("ls".into());
+    s.log.wait_for(3);
+    s.click(TERMINAL);
+    s.output.enter();
+    let did = s.log.wait_for(6);
+    assert_eq!(
+        &did[3..5],
+        [Did::Focus(EDITOR.into()), Did::Press(Shortcut::Enter)]
+    );
+}
+
+#[test]
+fn enter_is_not_pressed_when_nothing_was_pasted() {
+    let s = setup();
+    s.begin();
+    s.output.enter();
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(s.log.all(), []);
 }

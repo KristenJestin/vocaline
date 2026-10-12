@@ -17,6 +17,8 @@ writes one command on one line, and reads the answer.
 | `press` | the key went down: `stop` when loading or listening, otherwise `start` and remember when; answers the state reached |
 | `release` | the key went up: `stop` if it is still loading or listening and the key was held at least `hold_ms` (250 ms by default) since the `press` that started it; otherwise nothing; answers the state |
 | `start` | starts listening; answers the state reached |
+| `start --rule <name>` | `start`, with the rule of that name governing the dictation whatever the window; an unknown name is refused (`{"error":"no rule is named <name>"}`) and published as an `error` event |
+| `press --rule <name>` | `press`, with the rule applied if it starts a dictation |
 | `start --no-paste` | `start`, but the final phrases of this dictation are not pasted, only streamed |
 | `stop` | stops listening, the open phrase is finalised; answers the state reached |
 | `toggle` | `start` when idle, `stop` when loading or listening |
@@ -27,7 +29,10 @@ writes one command on one line, and reads the answer.
 `press` and `release` are for one key bound to both (hold to talk, or tap to start and tap to
 stop). A `release` with no `press` before it, or after a `press` that stopped the dictation, does
 nothing. A `press` while stopping is refused, like `start`. `start`, `stop` and `toggle` are for
-callers that are not a key. The event stream does not change.
+callers that are not a key. The event stream does not change with the rules per application (the
+README describes them): `partial` and `final` hold the phrases as heard, after the vocabulary,
+whatever a rule does to the paste. The only trace of a rule in the stream is an `error` event
+when a forced rule does not exist.
 
 The answer to `press`, `release`, `start`, `stop`, `toggle` and `status` is one JSON line, then the daemon closes the
 connection:
