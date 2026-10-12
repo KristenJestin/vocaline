@@ -88,6 +88,10 @@ pub struct EngineConfig {
     /// The GGUF model, Parakeet or Canary: crispasr knows which from the file. A relative path
     /// is read from `$XDG_DATA_HOME/vocaline/models`.
     pub model: PathBuf,
+    /// A model that obeys `language`, run beside `model` to decode each short phrase again
+    /// with a second of audio around it; read like `model`, `""` for none.
+    #[serde(deserialize_with = "none_if_empty")]
+    pub short_model: Option<PathBuf>,
     /// The Silero VAD model, or `auto` to let CrispASR fetch and cache it.
     pub vad_model: String,
     pub backend: Backend,
@@ -103,6 +107,7 @@ impl Default for EngineConfig {
         EngineConfig {
             command: PathBuf::from("crispasr"),
             model: PathBuf::from("parakeet-tdt-0.6b-v3-q8_0.gguf"),
+            short_model: Some(PathBuf::from("canary-1b-v2-q8_0.gguf")),
             vad_model: "auto".into(),
             backend: Backend::Cuda,
             language: "fr".into(),
@@ -144,15 +149,28 @@ impl Config {
 
     fn parse(text: &str, dirs: &Dirs) -> Result<Config, String> {
         let mut config: Config = toml::from_str(text).map_err(|e| e.to_string())?;
-        let model = expand_home(&config.engine.model);
-        config.engine.model = if model.is_absolute() {
-            model
-        } else {
-            dirs.data.join("models").join(model)
-        };
+        config.engine.model = model_path(&config.engine.model, dirs);
+        config.engine.short_model = config
+            .engine
+            .short_model
+            .map(|model| model_path(&model, dirs));
         config.engine.command = expand_home(&config.engine.command);
         Ok(config)
     }
+}
+
+fn model_path(model: &Path, dirs: &Dirs) -> PathBuf {
+    let model = expand_home(model);
+    if model.is_absolute() {
+        model
+    } else {
+        dirs.data.join("models").join(model)
+    }
+}
+
+fn none_if_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<PathBuf>, D::Error> {
+    let path = PathBuf::deserialize(d)?;
+    Ok((!path.as_os_str().is_empty()).then_some(path))
 }
 
 /// `~/x` is what people write in a configuration file; the shell is not there to expand it.
@@ -189,6 +207,27 @@ mod tests {
         assert_eq!(engine.language, "fr");
         assert_eq!(engine.partial_ms, 400);
         assert_eq!(engine.final_silence_ms, 700);
+    }
+
+    // Parakeet writes `Hello` for `allô`; Canary, given only the short phrases, keeps them in
+    // French for a few hundredths of a second of CPU each (#17).
+    #[test]
+    fn short_phrases_are_decoded_again_by_canary_by_default() {
+        let engine = Config::parse("", &dirs()).unwrap().engine;
+        assert_eq!(
+            engine.short_model,
+            Some(PathBuf::from(
+                "/data/vocaline/models/canary-1b-v2-q8_0.gguf"
+            ))
+        );
+    }
+
+    #[test]
+    fn an_empty_short_model_turns_the_second_decoding_off() {
+        let engine = Config::parse("[engine]\nshort_model = \"\"", &dirs())
+            .unwrap()
+            .engine;
+        assert_eq!(engine.short_model, None);
     }
 
     #[test]

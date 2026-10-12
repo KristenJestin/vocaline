@@ -3,18 +3,44 @@
 //!
 //! One process per dictation: the model is loaded when listening starts and unloaded when the
 //! process ends, after the end of the audio has finalised the open phrase.
+//!
+//! Parakeet ignores `-l` and drifts into English on short phrases (`allô` became `Hello?`);
+//! Canary obeys it but, streaming, costs ten times the CPU (#17). So a second process holds
+//! the short-phrase model while listening, and each phrase shorter than 2 s is
+//! decoded again by it, with a second of audio around it: 1 of 144 short French clips came
+//! out in another language, against 17 for Parakeet alone, for about 35 ms each.
 
 use super::{Engine, EngineEvent, EngineInput, Sink};
 use crate::config::{Backend, EngineConfig};
 use serde::Deserialize;
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+mod server;
+
 /// Lines of the engine's diagnostics kept to explain a failure; the rest is dropped.
 const KEPT_DIAGNOSTICS: usize = 12;
+
+const RATE: f64 = 16000.0;
+/// Phrases shorter than this are decoded again: they are the ones that drift, and the stream
+/// does not decode them again for their final. A longer phrase gets that final decoding on all
+/// of it; given to Canary too, phrases of 3.5 s came out no more French, and changed
+/// (`compte-rendu`, `Pensez`), 60 ms later.
+const SHORT_PHRASE_S: f64 = 2.0;
+/// The audio around a short phrase: on the phrase alone, Canary still wrote 5 of 144 clips in
+/// another language; with a second on each side, 1.
+const AROUND_S: f64 = 1.0;
+/// The audio kept for that, from the end: a short phrase is finalised within a second or two.
+const KEPT_AUDIO: usize = 20 * 16000;
+
+/// Decodes one phrase again; `None` keeps the stream's text.
+trait Redecode: Send {
+    fn transcribe(&mut self, pcm: &[i16]) -> Option<String>;
+}
 
 pub struct CrispAsr {
     config: EngineConfig,
@@ -52,18 +78,33 @@ impl CrispAsr {
                 "--stream-final-on-silence-ms",
                 &c.final_silence_ms.to_string(),
             ]);
-        // The bundled OpenMP pool busy-waits on every core while the GPU decodes: 38 s of CPU
-        // for 17 s of audio, against about 1 s with a single thread. On the CPU backend those
-        // threads do the work, so they are left alone.
-        if c.backend != Backend::Cpu {
-            command.env("OMP_NUM_THREADS", "1");
-        }
+        one_thread_on_a_gpu(&mut command, c.backend);
         command
     }
-}
 
-impl Engine for CrispAsr {
-    fn open(&self, sink: Sink) -> io::Result<Box<dyn EngineInput>> {
+    fn server_command(&self, model: &Path, port: u16) -> Command {
+        let c = &self.config;
+        let mut command = Command::new(&c.command);
+        command
+            .args([
+                "--server",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+            ])
+            .arg("-m")
+            .arg(model)
+            .args(["-l", &c.language, "--gpu-backend", c.backend.name(), "-np"]);
+        one_thread_on_a_gpu(&mut command, c.backend);
+        command
+    }
+
+    fn open_with(
+        &self,
+        sink: Sink,
+        mut short: Option<Box<dyn Redecode>>,
+    ) -> io::Result<Box<dyn EngineInput>> {
         let mut child = self
             .command()
             .stdin(Stdio::piped())
@@ -89,10 +130,14 @@ impl Engine for CrispAsr {
             }
         });
 
+        let heard = Arc::new(Mutex::new(Heard::default()));
+        let audio = Arc::clone(&heard);
+        let final_silence_s = f64::from(self.config.final_silence_ms) / 1000.0;
         thread::spawn(move || {
             let mut ready = false;
+            let mut previous_end = 0.0;
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let Some(event) = parse_line(&line) else {
+                let Some(mut event) = parse_line(&line) else {
                     continue;
                 };
                 // The first event comes after the first step: the model is loaded by then.
@@ -100,8 +145,26 @@ impl Engine for CrispAsr {
                     ready = true;
                     sink(EngineEvent::Ready);
                 }
+                if let (EngineEvent::Final { text, .. }, Some((t0, t1))) =
+                    (&mut event, times(&line))
+                {
+                    if let Some(short) = short.as_mut()
+                        && t1 - t0 < SHORT_PHRASE_S
+                    {
+                        // Before: never the previous phrase. After: the silence that ended it.
+                        let from = (t0 - AROUND_S).max(previous_end);
+                        let to = t1 + AROUND_S.min(final_silence_s);
+                        let pcm = audio.lock().unwrap().between(from, to);
+                        if let Some(again) = short.transcribe(&pcm) {
+                            *text = again;
+                        }
+                    }
+                    previous_end = t1;
+                }
                 sink(event);
             }
+            // Unloaded with the stream's model, before the stream says it ended.
+            drop(short);
             let _ = diagnostics_thread.join();
             let result = match child.wait() {
                 Ok(status) if status.success() => Ok(()),
@@ -117,16 +180,69 @@ impl Engine for CrispAsr {
             };
             sink(EngineEvent::Ended(result));
         });
-        Ok(Box::new(Input { stdin }))
+        Ok(Box::new(Input { stdin, heard }))
+    }
+}
+
+// The bundled OpenMP pool busy-waits on every core while the GPU decodes: 38 s of CPU for 17 s
+// of audio, against about 1 s with a single thread. On the CPU backend those threads do the
+// work, so they are left alone.
+fn one_thread_on_a_gpu(command: &mut Command, backend: Backend) {
+    if backend != Backend::Cpu {
+        command.env("OMP_NUM_THREADS", "1");
+    }
+}
+
+/// The last seconds of audio given to the stream, and where they start in it.
+#[derive(Default)]
+struct Heard {
+    start: usize,
+    samples: VecDeque<i16>,
+}
+
+impl Heard {
+    fn push(&mut self, pcm: &[i16]) {
+        self.samples.extend(pcm);
+        let excess = self.samples.len().saturating_sub(KEPT_AUDIO);
+        self.samples.drain(..excess);
+        self.start += excess;
+    }
+
+    /// The audio from `from` to `to`, in seconds since the stream started, as far as it is kept.
+    fn between(&self, from: f64, to: f64) -> Vec<i16> {
+        let index = |t: f64| {
+            ((t.max(0.0) * RATE) as usize)
+                .saturating_sub(self.start)
+                .min(self.samples.len())
+        };
+        self.samples
+            .range(index(from)..index(to))
+            .copied()
+            .collect()
+    }
+}
+
+impl Engine for CrispAsr {
+    fn open(&self, sink: Sink) -> io::Result<Box<dyn EngineInput>> {
+        let short = match &self.config.short_model {
+            Some(model) => Some(Box::new(server::Server::spawn(
+                |port| self.server_command(model, port),
+                &self.config.language,
+            )?) as Box<dyn Redecode>),
+            None => None,
+        };
+        self.open_with(sink, short)
     }
 }
 
 struct Input {
     stdin: ChildStdin,
+    heard: Arc<Mutex<Heard>>,
 }
 
 impl EngineInput for Input {
     fn write(&mut self, pcm: &[i16]) -> io::Result<()> {
+        self.heard.lock().unwrap().push(pcm);
         let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
         self.stdin.write_all(&bytes)
     }
@@ -143,6 +259,17 @@ struct Line {
     utterance_id: u64,
     #[serde(default)]
     text: String,
+}
+
+/// Where a final phrase starts and ends, in seconds since the stream started.
+fn times(line: &str) -> Option<(f64, f64)> {
+    #[derive(Deserialize)]
+    struct Times {
+        t0: f64,
+        t1: f64,
+    }
+    let times: Times = serde_json::from_str(line).ok()?;
+    Some((times.t0, times.t1))
 }
 
 /// One line of `--stream-json`; anything else the engine prints is not an event.
@@ -308,6 +435,7 @@ mod tests {
     fn run(script_name: &str, script: &str, audio: &[i16]) -> Vec<EngineEvent> {
         let config = EngineConfig {
             command: fake_crispasr(script_name, script),
+            short_model: None,
             ..EngineConfig::default()
         };
         let (tx, rx) = mpsc::channel();
@@ -372,5 +500,150 @@ mod tests {
             ..EngineConfig::default()
         };
         assert!(CrispAsr::new(config).open(Box::new(|_| {})).is_err());
+    }
+
+    /// Stands for the short-phrase model: answers `text` and keeps the audio it was given.
+    struct FakeShort {
+        text: Option<String>,
+        heard: Arc<Mutex<Vec<Vec<i16>>>>,
+    }
+
+    impl Redecode for FakeShort {
+        fn transcribe(&mut self, pcm: &[i16]) -> Option<String> {
+            self.heard.lock().unwrap().push(pcm.to_vec());
+            self.text.clone()
+        }
+    }
+
+    /// Runs `script` as the stream with `short` beside it; the audio counts tenths of a second.
+    fn run_with_short(
+        name: &str,
+        script: &str,
+        seconds: usize,
+        text: Option<&str>,
+    ) -> (Vec<EngineEvent>, Vec<Vec<i16>>) {
+        let config = EngineConfig {
+            command: fake_crispasr(name, script),
+            ..EngineConfig::default()
+        };
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let short = FakeShort {
+            text: text.map(String::from),
+            heard: Arc::clone(&heard),
+        };
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let mut input = CrispAsr::new(config)
+            .open_with(
+                Box::new(move |e| tx.lock().unwrap().send(e).unwrap()),
+                Some(Box::new(short)),
+            )
+            .unwrap();
+        let audio: Vec<i16> = (0..seconds * 16000).map(|i| (i / 1600) as i16).collect();
+        input.write(&audio).unwrap();
+        input.finish();
+        let mut events = Vec::new();
+        loop {
+            let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let ended = matches!(event, EngineEvent::Ended(_));
+            if !matches!(event, EngineEvent::Ready) {
+                events.push(event);
+            }
+            if ended {
+                let heard = heard.lock().unwrap().clone();
+                return (events, heard);
+            }
+        }
+    }
+
+    fn final_(utterance: u64, text: &str) -> EngineEvent {
+        EngineEvent::Final {
+            utterance,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn a_short_phrase_is_decoded_again_with_a_second_of_audio_around_it() {
+        let script = r#"
+            cat >/dev/null
+            echo '{"type":"final","utterance_id":1,"text":"Hello?","t0":1.500,"t1":2.200}'
+        "#;
+        let (events, heard) = run_with_short("short", script, 4, Some("Allô ?"));
+        assert_eq!(events, [final_(1, "Allô ?"), EngineEvent::Ended(Ok(()))]);
+        // From 0.5 s to 2.2 s plus the final silence (700 ms), shorter than a second.
+        let [pcm] = heard.as_slice() else {
+            panic!("{heard:?}")
+        };
+        assert_eq!(pcm.len(), (29 - 5) * 1600);
+        assert_eq!((pcm[0], pcm[pcm.len() - 1]), (5, 28));
+    }
+
+    #[test]
+    fn the_audio_before_a_short_phrase_stops_at_the_end_of_the_previous_one() {
+        let script = r#"
+            cat >/dev/null
+            echo '{"type":"final","utterance_id":1,"text":"Un.","t0":0.200,"t1":0.800}'
+            echo '{"type":"final","utterance_id":2,"text":"Deux.","t0":1.200,"t1":1.600}'
+        "#;
+        let (_, heard) = run_with_short("previous", script, 3, Some("Texte."));
+        assert_eq!(heard.len(), 2);
+        assert_eq!(heard[1][0], 8, "starts where the previous phrase ended");
+    }
+
+    #[test]
+    fn a_long_phrase_keeps_the_text_of_the_stream() {
+        let script = r#"
+            cat >/dev/null
+            echo '{"type":"final","utterance_id":1,"text":"Une longue phrase.","t0":0.500,"t1":2.600}'
+        "#;
+        let (events, heard) = run_with_short("long", script, 4, Some("Autre."));
+        assert_eq!(
+            events,
+            [final_(1, "Une longue phrase."), EngineEvent::Ended(Ok(()))]
+        );
+        assert!(heard.is_empty());
+    }
+
+    #[test]
+    fn a_short_model_that_does_not_answer_leaves_the_text_of_the_stream() {
+        let script = r#"
+            cat >/dev/null
+            echo '{"type":"final","utterance_id":1,"text":"Oui.","t0":0.500,"t1":1.000}'
+        "#;
+        let (events, _) = run_with_short("silent", script, 2, None);
+        assert_eq!(events, [final_(1, "Oui."), EngineEvent::Ended(Ok(()))]);
+    }
+
+    #[test]
+    fn the_short_model_runs_as_a_server_on_the_same_engine_and_language() {
+        let config = EngineConfig {
+            command: "/opt/crispasr".into(),
+            short_model: Some("/models/c.gguf".into()),
+            ..EngineConfig::default()
+        };
+        let command = CrispAsr::new(config).server_command(Path::new("/models/c.gguf"), 4242);
+        assert_eq!(command.get_program(), "/opt/crispasr");
+        let joined = command
+            .get_args()
+            .map(|a| a.to_str().unwrap())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for expected in [
+            "--server --host 127.0.0.1 --port 4242",
+            "-m /models/c.gguf",
+            "-l fr",
+            "--gpu-backend cuda",
+        ] {
+            assert!(
+                joined.contains(expected),
+                "{expected} missing from {joined}"
+            );
+        }
+        assert!(
+            command
+                .get_envs()
+                .any(|(k, v)| k == "OMP_NUM_THREADS" && v == Some("1".as_ref()))
+        );
     }
 }
