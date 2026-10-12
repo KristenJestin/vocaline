@@ -54,7 +54,7 @@ optional, these are the defaults:
 [engine]
 command = "crispasr"                          # the binary: a path, or a name in PATH
 model = "parakeet-tdt-0.6b-v3-q8_0.gguf"      # or canary-1b-v2-q8_0.gguf; relative: read from ~/.local/share/vocaline/models
-vad_model = "auto"
+vad_model = "ggml-silero-v6.2.0.bin"          # relative: read from the models folder; "auto": CrispASR fetches it
 backend = "cuda"                              # cuda, vulkan or cpu
 language = "fr"
 partial_ms = 400                              # the open phrase is decoded again this often
