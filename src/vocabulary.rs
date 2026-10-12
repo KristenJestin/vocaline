@@ -115,7 +115,7 @@ impl Vocabulary {
 
 /// Where the words `heard` end in `text` when they start at `at`, with only whitespace between
 /// them and a boundary after the last one.
-fn matched(heard: &[Vec<char>], text: &[char], at: usize) -> Option<usize> {
+pub(crate) fn matched(heard: &[Vec<char>], text: &[char], at: usize) -> Option<usize> {
     let mut end = at;
     for (n, word) in heard.iter().enumerate() {
         if n > 0 {
@@ -137,7 +137,7 @@ fn matched(heard: &[Vec<char>], text: &[char], at: usize) -> Option<usize> {
 }
 
 /// Lowercase, without accents: what two spellings of a word have in common.
-fn fold(word: &str) -> Vec<char> {
+pub(crate) fn fold(word: &str) -> Vec<char> {
     word.chars().map(fold_char).collect()
 }
 

@@ -79,6 +79,9 @@ hold_ms = 250                                 # a key held this long stops on re
 
 [output]
 paste = true                                  # false: the phrases are only in the event stream
+
+[text]
+filler_words = ["euh", "heu", "euhm", "hum", "hmm", "mmh", "uh", "um", "mm"]  # dropped from every phrase; []: off
 ```
 
 Rules per application are `[[rule]]` tables, none by default: see "Rules per application".
@@ -229,6 +232,27 @@ and `teach` works with no daemon running.
 line. They are kept in the daemon's memory only: never written to disk or to a log, and gone when
 the daemon stops.
 
+## Filler words
+
+The model writes everything that is said, hesitations included: `Mais surtout sur la partie
+euh... Vocaline et tout.` Vocaline drops the words of `filler_words` (see "Configuration")
+and the punctuation that hangs on them, so that phrase becomes `Mais surtout sur la partie
+Vocaline et tout.` No model is involved and it costs nothing.
+
+- Whole words only, case and accents ignored, like the vocabulary: `euh` goes, `heureux` and
+  `humain` stay. The words that carry a meaning (`bah`, `ben`, `bon`, `oui`, `yeah`) are not in
+  the default list; add the ones you want gone. An empty list (`filler_words = []`) turns the
+  step off.
+- A filler that started a phrase leaves the next word with a capital (`Euh, donc on y va.`
+  becomes `Donc on y va.`). A `.`, `!` or `?` hanging on a last filler goes back to the word
+  before it (`on y va, euh.` becomes `on y va.`); an ellipsis goes with it.
+- A phrase made only of fillers disappears: it is not pasted, not in `vocaline last`, and
+  it counts for no word in the statistics. Its `final` event still closes the utterance, with an
+  empty `text`.
+- It happens right after the vocabulary, where the engine's text comes in, so the partial
+  phrase, the final phrase and the pasted text hold the same words. `mm` is in the list because
+  the model writes it for a hum: if you dictate millimetres, take it out.
+
 ## Statistics
 
 ```sh
@@ -236,7 +260,7 @@ vocaline stats           # today, the last 7 days, all time
 vocaline stats --json    # the same, as one JSON object, for a program
 ```
 
-For each period: the dictations, the words, the minutes heard, the time from the stop to the
+For each period: the dictations, the words (without the filler words), the minutes heard, the time from the stop to the
 paste (median and maximum), and the same by application (the class of the window the dictation
 started in) and, for the last 7 days, by day. A dictation that pastes nothing (`start --no-paste`,
 `paste = false`) does not ask for the window, so it is counted under `unknown`, like one whose

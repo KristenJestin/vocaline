@@ -1,6 +1,7 @@
 use super::*;
 use crate::audio::Capture;
 use crate::engine::{EngineInput, Sink};
+use crate::phrases::Fillers;
 use crate::rules::Rule;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
@@ -2034,6 +2035,7 @@ fn recording_daemon(
         HOLD,
         clock,
         no_vocabulary(),
+        Fillers::default(),
         rules,
     )
 }
@@ -2339,4 +2341,109 @@ fn a_few_dictations_in_two_applications_show_up_per_application() {
     assert!(text.contains("3 dictations, 12 words, 0.6 min"), "{text}");
     assert!(line("org.example.Editor").contains("2 dictations, 8 words, 0.4 min"));
     assert!(line("org.example.Chat").contains("1 dictation, 4 words, 0.2 min"));
+}
+
+/// A daemon that pastes into a fake output, with its own list of filler words.
+fn filler_daemon(engine: FakeEngine, fillers: Fillers, file: PathBuf) -> (Handle, FakePaste) {
+    let paste = FakePaste::default();
+    let handle = spawn_recording(
+        None,
+        Arc::new(FakeMic::default()),
+        Arc::new(engine),
+        Some(Box::new(paste.clone())),
+        HOLD,
+        Arc::new(Instant::now),
+        file,
+        fillers,
+        Vec::new(),
+    );
+    (handle, paste)
+}
+
+#[test]
+fn fillers_are_dropped_from_the_partial_the_final_and_the_paste_after_the_vocabulary() {
+    let file = vocabulary_file("fillers");
+    crate::vocabulary::teach(&file, "foo bar", "Foobar").unwrap();
+    let engine = FakeEngine {
+        script: vec![
+            (0, EngineEvent::Ready),
+            (1_600, partial(1, "Euh ouvre foo bar euh...")),
+            (3_200, final_(1, "Euh, ouvre foo bar euh.")),
+        ],
+        ..FakeEngine::default()
+    };
+    let (daemon, paste) = filler_daemon(engine, Fillers::default(), file);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&ev_partial(1, "Ouvre Foobar"));
+    watcher.skip_to(&ev_final(1, "Ouvre Foobar."));
+    assert_eq!(daemon.last(), ["Ouvre Foobar."]);
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        handed(&paste),
+        [Handed::Begin, Handed::Phrase("Ouvre Foobar.".into())]
+    );
+}
+
+#[test]
+fn a_phrase_of_only_fillers_closes_its_utterance_but_is_neither_kept_nor_pasted() {
+    let engine = FakeEngine {
+        script: vec![
+            (0, EngineEvent::Ready),
+            (1_600, final_(1, "Euh.")),
+            (3_200, final_(2, "Bonjour.")),
+        ],
+        ..FakeEngine::default()
+    };
+    let (daemon, paste) = filler_daemon(engine, Fillers::default(), no_vocabulary());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    // The stream keeps one final per utterance: the reader that opened it can close it.
+    watcher.skip_to(&ev_final(1, ""));
+    watcher.skip_to(&ev_final(2, "Bonjour."));
+    assert_eq!(daemon.last(), ["Bonjour."]);
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        handed(&paste),
+        [Handed::Begin, Handed::Phrase("Bonjour.".into())]
+    );
+}
+
+#[test]
+fn an_empty_filler_list_leaves_the_phrases_as_the_engine_wrote_them() {
+    let (daemon, paste) = filler_daemon(
+        saying("Euh, donc on y va."),
+        Fillers::new::<&str>(&[]),
+        no_vocabulary(),
+    );
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&ev_final(1, "Euh, donc on y va."));
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        handed(&paste),
+        [Handed::Begin, Handed::Phrase("Euh, donc on y va.".into())]
+    );
+}
+
+#[test]
+fn fillers_are_not_counted_as_words() {
+    let ledger = FakeLedger::default();
+    let mic = FakeMic {
+        chunks: Some(120),
+        ..FakeMic::default()
+    };
+    let daemon = recording_daemon(
+        Box::new(ledger.clone()),
+        Arc::new(mic),
+        Arc::new(saying("Euh, donc on y va, hum.")),
+        None,
+        Arc::new(Instant::now),
+        Vec::new(),
+    );
+    dictate_to_the_end(&daemon, Command::StartNoPaste);
+    assert_eq!(ledger.kept()[0].words, 4);
 }

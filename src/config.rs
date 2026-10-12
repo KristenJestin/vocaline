@@ -1,5 +1,6 @@
 //! What differs between machines: the engine binary, the model, the backend, the cadence.
 
+use crate::phrases::DEFAULT_FILLERS;
 use crate::rules::{self, Rule};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -68,6 +69,7 @@ pub struct Config {
     pub engine: EngineConfig,
     pub key: KeyConfig,
     pub output: OutputConfig,
+    pub text: TextConfig,
     /// What a dictation does depending on its window, first match wins (see `rules`).
     pub rule: Vec<Rule>,
 }
@@ -83,6 +85,22 @@ pub struct OutputConfig {
 impl Default for OutputConfig {
     fn default() -> OutputConfig {
         OutputConfig { paste: true }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TextConfig {
+    /// Hesitations the engine writes, dropped from every phrase with the punctuation that hangs
+    /// on them; whole words, case and accents ignored. Empty: nothing is dropped.
+    pub filler_words: Vec<String>,
+}
+
+impl Default for TextConfig {
+    fn default() -> TextConfig {
+        TextConfig {
+            filler_words: DEFAULT_FILLERS.map(String::from).to_vec(),
+        }
     }
 }
 
@@ -227,6 +245,26 @@ mod tests {
         assert!(Config::parse("", &dirs()).unwrap().output.paste);
         let config = Config::parse("[output]\npaste = false", &dirs()).unwrap();
         assert!(!config.output.paste);
+    }
+
+    #[test]
+    fn the_filler_words_are_the_ones_of_the_issue_and_the_file_can_change_the_list() {
+        let words = Config::parse("", &dirs()).unwrap().text.filler_words;
+        assert_eq!(
+            words,
+            ["euh", "heu", "euhm", "hum", "hmm", "mmh", "uh", "um", "mm"]
+        );
+        let text = "[text]\nfiller_words = [\"euh\", \"bof\"]";
+        let words = Config::parse(text, &dirs()).unwrap().text.filler_words;
+        assert_eq!(words, ["euh", "bof"]);
+        let text = "[text]\nfiller_words = []";
+        assert!(
+            Config::parse(text, &dirs())
+                .unwrap()
+                .text
+                .filler_words
+                .is_empty()
+        );
     }
 
     #[test]

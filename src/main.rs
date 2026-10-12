@@ -5,6 +5,7 @@ mod daemon;
 mod engine;
 mod events;
 mod output;
+mod phrases;
 mod rules;
 mod setup;
 mod stats;
@@ -16,6 +17,7 @@ use cli::Cli;
 use config::{Config, Dirs};
 use engine::CrispAsr;
 use output::{Hyprland, Output, Paste, Ports, Timing, Wayland, Wtype};
+use phrases::Fillers;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -118,6 +120,7 @@ fn run_daemon(dirs: &Dirs, audio_file: Option<&Path>) -> Result<(), String> {
             hold,
             Arc::new(Instant::now),
             dirs.vocabulary_file(),
+            Fillers::new(&config.text.filler_words),
             config.rule,
         ),
     );
