@@ -7,8 +7,8 @@ pkgrel=1
 pkgdesc='Local dictation: the phrase shows while you speak, and is pasted when you stop'
 arch=(x86_64)
 url='https://github.com/KristenJestin/vocaline'
-# CrispASR is MIT, the OpenBLAS it bundles BSD-3-Clause.
-license=(MIT BSD-3-Clause)
+# Vocaline is Apache-2.0; the CrispASR it bundles is MIT, and its OpenBLAS BSD-3-Clause.
+license=(Apache-2.0 MIT BSD-3-Clause)
 depends=(
   gcc-libs glibc
   # The GCC runtime CrispASR links: the system's copy instead of the one in its archive.
@@ -80,6 +80,7 @@ check() {
 package() {
   install -Dm755 "$srcdir/target/release/vocaline" "$pkgdir/usr/bin/vocaline"
   install -Dm644 "$_root/packaging/vocaline.service" "$pkgdir/usr/lib/systemd/user/vocaline.service"
+  install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" "$_root/LICENSE" "$_root/NOTICE"
   install -Dm644 -t "$pkgdir/usr/share/doc/vocaline" "$_root/README.md" "$_root/docs/events.md"
 
   # The engine keeps its archive's layout: crispasr finds its libraries beside itself.

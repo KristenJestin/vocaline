@@ -1,0 +1,5 @@
+Vocaline
+Copyright 2026 Kristen Jestin
+
+The Arch Linux package of Vocaline bundles CrispASR (https://github.com/CrispStrobe/CrispASR),
+under the MIT License; its licence and third-party notices are installed beside it.
