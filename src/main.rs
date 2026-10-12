@@ -5,6 +5,7 @@ mod daemon;
 mod engine;
 mod events;
 mod output;
+mod rules;
 mod steady;
 mod vocabulary;
 
