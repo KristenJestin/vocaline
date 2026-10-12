@@ -313,18 +313,34 @@ fn daemon(mic: FakeMic, engine: FakeEngine) -> (Handle, Arc<FakeMic>, Arc<FakeEn
 enum Handed {
     Begin,
     Phrase(String),
+    Enter,
 }
 
+/// What the daemon handed over, and the class of the window the fake desktop has focused.
 #[derive(Clone, Default)]
-struct FakePaste(Arc<Mutex<Vec<Handed>>>);
+struct FakePaste(Arc<Mutex<Vec<Handed>>>, Arc<Mutex<Option<String>>>);
+
+impl FakePaste {
+    /// A fake output whose focused window is of class `class`.
+    fn in_window(class: &str) -> FakePaste {
+        let paste = FakePaste::default();
+        *paste.1.lock().unwrap() = Some(class.into());
+        paste
+    }
+}
 
 impl Paste for FakePaste {
-    fn begin(&self) {
+    fn begin(&self) -> Option<String> {
         self.0.lock().unwrap().push(Handed::Begin);
+        self.1.lock().unwrap().clone()
     }
 
     fn phrase(&self, text: String) {
         self.0.lock().unwrap().push(Handed::Phrase(text));
+    }
+
+    fn enter(&self) {
+        self.0.lock().unwrap().push(Handed::Enter);
     }
 }
 

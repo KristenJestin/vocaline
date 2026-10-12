@@ -56,6 +56,7 @@ pub struct Window {
 pub enum Shortcut {
     CtrlV,
     CtrlShiftV,
+    Enter,
 }
 
 /// The window manager.
@@ -78,9 +79,11 @@ pub trait Keyboard: Send + Sync {
 
 /// Where the daemon hands what it heard.
 pub trait Paste: Send {
-    /// A dictation starts: its phrases go to the window focused now.
-    fn begin(&self);
+    /// A dictation starts: its phrases go to the window focused now, whose class is returned.
+    fn begin(&self) -> Option<String>;
     fn phrase(&self, text: String);
+    /// Presses Enter in the window of the dictation, once what was handed over is pasted.
+    fn enter(&self);
 }
 
 pub struct Ports {
@@ -109,6 +112,7 @@ impl Default for Timing {
 enum Job {
     Begin(Option<Window>),
     Phrase(String),
+    Enter,
 }
 
 pub struct Output {
@@ -134,18 +138,24 @@ impl Output {
 }
 
 impl Paste for Output {
-    fn begin(&self) {
+    fn begin(&self) -> Option<String> {
         // Asked now, on the daemon's thread: the worker may still be pasting the last
         // dictation, and the focus it gives would be its own.
         let target = self.desktop.focused().unwrap_or_else(|e| {
             eprintln!("vocaline: the focused window could not be read: {e}");
             None
         });
+        let class = target.as_ref().map(|window| window.class.clone());
         let _ = self.jobs.send(Job::Begin(target));
+        class
     }
 
     fn phrase(&self, text: String) {
         let _ = self.jobs.send(Job::Phrase(text));
+    }
+
+    fn enter(&self) {
+        let _ = self.jobs.send(Job::Enter);
     }
 }
 
@@ -200,15 +210,27 @@ impl Worker {
                         Err(e) => eprintln!("vocaline: a phrase could not be pasted: {e}"),
                     }
                 }
+                // Nothing pasted, nothing to send: Enter alone would run an empty line or send
+                // an empty message.
+                Job::Enter if self.first => {}
+                Job::Enter => {
+                    if let Err(e) = self.enter() {
+                        eprintln!("vocaline: Enter could not be pressed: {e}");
+                    }
+                }
             }
         }
     }
 
-    fn paste(&mut self, text: &str) -> io::Result<()> {
+    fn wait_for_modifiers(&self) {
         // A source that cannot tell is taken as nothing held: waiting forever would lose more.
         while self.ports.desktop.modifier_held().unwrap_or(false) {
             thread::sleep(self.timing.poll);
         }
+    }
+
+    fn paste(&mut self, text: &str) -> io::Result<()> {
+        self.wait_for_modifiers();
         if self.saved.is_none() {
             self.saved = Some(self.ports.clipboard.save()?);
         }
@@ -220,6 +242,17 @@ impl Worker {
         self.ports.keyboard.press(shortcut_for(&class))?;
         self.pasted_at = Some(Instant::now());
         Ok(())
+    }
+
+    fn enter(&mut self) -> io::Result<()> {
+        self.wait_for_modifiers();
+        self.focus_target();
+        // Enter sooner than the application's read of the clipboard would run the line before
+        // the text is in it.
+        if let Some(at) = self.pasted_at {
+            thread::sleep(self.timing.settle.saturating_sub(at.elapsed()));
+        }
+        self.ports.keyboard.press(Shortcut::Enter)
     }
 
     /// Gives the focus back to the window of the dictation, and returns the class of the
@@ -341,6 +374,7 @@ impl Wtype {
             Shortcut::CtrlShiftV => vec![
                 "-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl",
             ],
+            Shortcut::Enter => vec!["-k", "Return"],
         }
     }
 }
