@@ -66,12 +66,15 @@ impl Drop for FakeCapture {
 }
 
 /// An engine that replays a script: each event once it has received that many samples, then
-/// `on_finish` when the audio ends, then `Ended` unless `hold_end`.
+/// `on_finish` when the audio ends, then `Ended` unless `hold_end`, after `exit_delay`.
 #[derive(Default)]
 struct FakeEngine {
     script: Vec<(usize, EngineEvent)>,
     on_finish: Vec<EngineEvent>,
     hold_end: bool,
+    /// How long the engine takes to exit once its last event is sent, like crispasr unloading
+    /// its model.
+    exit_delay: Duration,
     fail: bool,
     /// Only the first dictation hears the script: the next ones are silent.
     first_only: bool,
@@ -83,6 +86,7 @@ struct FakeInput {
     script: VecDeque<(usize, EngineEvent)>,
     on_finish: Vec<EngineEvent>,
     hold_end: bool,
+    exit_delay: Duration,
     received: usize,
     sink: Arc<Sink>,
 }
@@ -114,6 +118,7 @@ impl Engine for FakeEngine {
                 self.on_finish.clone()
             },
             hold_end: self.hold_end,
+            exit_delay: self.exit_delay,
             received: 0,
             sink,
         };
@@ -140,6 +145,7 @@ impl EngineInput for FakeInput {
         for event in self.on_finish {
             (self.sink)(event);
         }
+        thread::sleep(self.exit_delay);
         if !self.hold_end {
             (self.sink)(EngineEvent::Ended(Ok(())));
         }
@@ -1109,6 +1115,86 @@ fn the_last_utterance_open_at_the_stop_is_in_the_paste() {
     assert_eq!(
         *paste.0.lock().unwrap(),
         [Handed::Begin, Handed::Phrase("Bonjour. Ça va ?".into())]
+    );
+}
+
+/// An engine that has sent its last final and says so, then takes a second to exit.
+fn slow_to_exit() -> FakeEngine {
+    FakeEngine {
+        on_finish: vec![final_(1, "Bonjour."), EngineEvent::Flushed],
+        exit_delay: ms(1_000),
+        ..FakeEngine::default()
+    }
+}
+
+/// Waits for the output to be handed a phrase, and tells when that was.
+fn pasted_within(paste: &FakePaste, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    while Instant::now() < deadline {
+        if paste
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|handed| matches!(handed, Handed::Phrase(_)))
+        {
+            return true;
+        }
+        thread::sleep(ms(5));
+    }
+    false
+}
+
+#[test]
+fn the_paste_does_not_wait_for_the_engine_to_exit() {
+    let (daemon, paste) = pasting_daemon(slow_to_exit());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    daemon.command(Command::Stop).unwrap();
+    assert!(
+        pasted_within(&paste, ms(500)),
+        "the engine had said its last final; the paste waited for its exit"
+    );
+    // The model is still being unloaded, so the daemon is not idle yet.
+    assert_eq!(daemon.command(Command::Status), Ok(State::Stopping));
+    watcher.skip_to(&state(State::Stopping));
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        *paste.0.lock().unwrap(),
+        [Handed::Begin, Handed::Phrase("Bonjour.".into())]
+    );
+}
+
+#[test]
+fn a_dictation_cannot_start_while_the_engine_is_still_exiting_after_the_paste() {
+    let (daemon, paste) = pasting_daemon(slow_to_exit());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    daemon.command(Command::Stop).unwrap();
+    assert!(pasted_within(&paste, ms(500)));
+    assert!(daemon.command(Command::Start).is_err());
+    watcher.skip_to(&state(State::Stopping));
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(daemon.command(Command::Start), Ok(State::Loading));
+}
+
+#[test]
+fn an_engine_that_never_says_it_flushed_is_pasted_when_it_ends() {
+    let engine = FakeEngine {
+        on_finish: vec![final_(1, "Bonjour.")],
+        exit_delay: ms(600),
+        ..FakeEngine::default()
+    };
+    let (daemon, paste) = pasting_daemon(engine);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    daemon.command(Command::Stop).unwrap();
+    assert!(!pasted_within(&paste, ms(200)));
+    watcher.skip_to(&state(State::Stopping));
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        *paste.0.lock().unwrap(),
+        [Handed::Begin, Handed::Phrase("Bonjour.".into())]
     );
 }
 
