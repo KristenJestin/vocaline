@@ -31,6 +31,16 @@ of it is in this repository.
    The same repository has `q5_0` and `q4_k` for a smaller machine. From the full
    `parakeet-tdt-0.6b-v3.gguf`, `crispasr-quantize` makes any of them.
 
+   Parakeet guesses the language by itself and ignores `language`: a short phrase can come out
+   in English (`allô` → `Hello?`). **Canary 1B v2** obeys `language`, at a cost: on the same
+   GPU it takes about 3.5 times the CPU while you speak, 0.4 GB more VRAM and 0.15 s more
+   before each final. To use it, download it the same way and set `model`:
+
+   ```sh
+   curl -L -o ~/.local/share/vocaline/models/canary-1b-v2-q8_0.gguf \
+     https://huggingface.co/cstr/canary-1b-v2-GGUF/resolve/main/canary-1b-v2-q8_0.gguf
+   ```
+
 3. **Silero VAD**: nothing to do. With `vad_model = "auto"` (the default), CrispASR downloads
    `ggml-silero-v6.2.0.bin` from `ggml-org/whisper-vad` on Hugging Face once and keeps it in
    `~/.cache/crispasr`. Set `vad_model` to a path to use a file of your own.
@@ -43,7 +53,7 @@ optional, these are the defaults:
 ```toml
 [engine]
 command = "crispasr"                          # the binary: a path, or a name in PATH
-model = "parakeet-tdt-0.6b-v3-q8_0.gguf"      # relative: read from ~/.local/share/vocaline/models
+model = "parakeet-tdt-0.6b-v3-q8_0.gguf"      # or canary-1b-v2-q8_0.gguf; relative: read from ~/.local/share/vocaline/models
 vad_model = "auto"
 backend = "cuda"                              # cuda, vulkan or cpu
 language = "fr"

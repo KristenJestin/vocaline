@@ -28,8 +28,11 @@ impl CrispAsr {
     fn command(&self) -> Command {
         let c = &self.config;
         let mut command = Command::new(&c.command);
+        // No `--backend`: crispasr reads the engine family from the model file, so Parakeet
+        // (light, but it ignores `-l` and drifts into English on short phrases) and Canary
+        // (which obeys `-l`, for several times the CPU) are one line of configuration apart.
         command
-            .args(["--stream", "--stream-json", "--backend", "parakeet", "-m"])
+            .args(["--stream", "--stream-json", "-m"])
             .arg(&c.model)
             .args(["-l", &c.language, "--gpu-backend", c.backend.name()])
             .args(["--vad", "--vad-model", &c.vad_model])
@@ -216,7 +219,6 @@ mod tests {
         for expected in [
             "--stream",
             "--stream-json",
-            "--backend parakeet",
             "-m /models/p.gguf",
             "-l fr",
             "--gpu-backend cuda",
@@ -253,6 +255,26 @@ mod tests {
                 "{expected} missing from {joined}"
             );
         }
+    }
+
+    // Parakeet ignores `-l fr` and wrote `Hello` for `allô`; Canary obeys it. Choosing the
+    // model file must be enough to switch, so the command names no engine family.
+    #[test]
+    fn short_french_utterances_can_use_a_model_that_obeys_the_language() {
+        let config = EngineConfig {
+            model: "/models/canary-1b-v2-q8_0.gguf".into(),
+            ..EngineConfig::default()
+        };
+        let command = CrispAsr::new(config).command();
+        let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert!(
+            !args.contains(&"--backend"),
+            "crispasr reads the engine family from the model file: {args:?}"
+        );
+        assert!(
+            args.join(" ")
+                .contains("-m /models/canary-1b-v2-q8_0.gguf -l fr")
+        );
     }
 
     // OpenMP threads spin while the GPU works: 38 s of CPU for 17 s of audio, measured.
