@@ -8,7 +8,10 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
-const WAIT: Duration = Duration::from_secs(5);
+// How long a test waits for something that must arrive. Generous, because a loaded machine
+// (a build running beside the tests) can stall a thread for seconds; it costs nothing when the
+// thing arrives at once, only a failing test waits all of it.
+const WAIT: Duration = Duration::from_secs(30);
 
 /// A microphone that hands over 100 ms of a steady tone every 5 ms, `chunks` times (forever
 /// when `None`), and counts the captures left open.
@@ -157,6 +160,9 @@ impl EngineInput for FakeInput {
 /// it), says `Ready` once loaded, and its final tells how many samples it received in all.
 struct SlowEngine {
     load: Duration,
+    /// The model is not loaded before this many samples were received, however long `load` is:
+    /// a loaded machine can starve the microphone thread for longer than the load takes.
+    ready_after: usize,
     /// The samples received when `Ready` was said.
     before_ready: Arc<AtomicUsize>,
 }
@@ -171,10 +177,15 @@ impl Engine for SlowEngine {
     fn open(&self, sink: Sink) -> io::Result<Box<dyn EngineInput>> {
         let sink = Arc::new(sink);
         let received = Arc::new(AtomicUsize::new(0));
-        let (load, before_ready) = (self.load, Arc::clone(&self.before_ready));
+        let (load, ready_after) = (self.load, self.ready_after);
+        let before_ready = Arc::clone(&self.before_ready);
         let (said, count) = (Arc::clone(&sink), Arc::clone(&received));
         let loaded = thread::spawn(move || {
             thread::sleep(load);
+            let deadline = Instant::now() + WAIT;
+            while count.load(Ordering::SeqCst) < ready_after && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
             before_ready.store(count.load(Ordering::SeqCst), Ordering::SeqCst);
             said(EngineEvent::Ready);
         });
@@ -743,10 +754,15 @@ fn when_the_audio_ends_the_dictation_stops_by_itself() {
     ]);
 }
 
-fn slow_daemon(load: Duration, mic: FakeMic) -> (Handle, Arc<AtomicUsize>, FakePaste) {
+fn slow_daemon(
+    load: Duration,
+    ready_after: usize,
+    mic: FakeMic,
+) -> (Handle, Arc<AtomicUsize>, FakePaste) {
     let before_ready = Arc::new(AtomicUsize::new(0));
     let engine = SlowEngine {
         load,
+        ready_after,
         before_ready: Arc::clone(&before_ready),
     };
     let paste = FakePaste::default();
@@ -771,7 +787,7 @@ fn words_spoken_while_the_model_loads_reach_the_transcript() {
         chunks: Some(30),
         ..FakeMic::default()
     };
-    let (daemon, before_ready, paste) = slow_daemon(Duration::from_millis(300), mic);
+    let (daemon, before_ready, paste) = slow_daemon(Duration::from_millis(300), 48_000, mic);
     let watcher = Watcher::on(&daemon);
     daemon.command(Command::Start).unwrap();
     watcher.skip_to(&state(State::Loading));
@@ -794,7 +810,7 @@ fn speech_goes_on_after_the_model_is_ready_and_nothing_before_it_is_lost() {
         chunks: Some(100),
         ..FakeMic::default()
     };
-    let (daemon, before_ready, _) = slow_daemon(Duration::from_millis(200), mic);
+    let (daemon, before_ready, _) = slow_daemon(Duration::from_millis(200), 0, mic);
     let watcher = Watcher::on(&daemon);
     daemon.command(Command::Start).unwrap();
     watcher.skip_to(&state(State::Loading));

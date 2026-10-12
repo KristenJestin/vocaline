@@ -330,10 +330,30 @@ mod tests {
         path
     }
 
+    /// Runs the fake. Another test thread may fork while the script is still open for writing:
+    /// the child holds that descriptor until its own exec, and the kernel refuses to run a file
+    /// someone has open for writing (ETXTBSY). That ends as soon as the child has exec'd, so
+    /// the spawn is tried again; it succeeds the first time on a machine that is not busy.
+    fn spawn_fake(name: &str, script: &str) -> Box<dyn Capture> {
+        let path = fake_pw_record(name, script);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match PwRecord::spawn(&path) {
+                Err(e)
+                    if e.kind() == io::ErrorKind::ExecutableFileBusy
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                result => return result.unwrap(),
+            }
+        }
+    }
+
     #[test]
     fn a_recorder_that_fails_at_once_ends_the_capture_with_its_diagnostics() {
         let script = "echo 'error: connection refused' >&2; echo 'no PipeWire' >&2; exit 1";
-        let mut capture = PwRecord::spawn(&fake_pw_record("fails", script)).unwrap();
+        let mut capture = spawn_fake("fails", script);
         let error = capture.read(&mut [0; 160]).unwrap_err().to_string();
         assert!(error.contains("pw-record"), "{error}");
         assert!(error.contains("connection refused"), "{error}");
@@ -342,14 +362,14 @@ mod tests {
 
     #[test]
     fn a_recorder_that_ends_without_any_audio_is_an_error_even_when_it_exits_well() {
-        let mut capture = PwRecord::spawn(&fake_pw_record("silent", "exit 0")).unwrap();
+        let mut capture = spawn_fake("silent", "exit 0");
         assert!(capture.read(&mut [0; 160]).is_err());
     }
 
     #[test]
     fn a_recorder_that_ends_after_its_audio_ends_the_capture_quietly() {
         let script = "head -c 640 /dev/zero";
-        let mut capture = PwRecord::spawn(&fake_pw_record("clean", script)).unwrap();
+        let mut capture = spawn_fake("clean", script);
         let mut buf = [1; 320];
         assert_eq!(capture.read(&mut buf).unwrap(), 320);
         assert_eq!(capture.read(&mut buf).unwrap(), 0);
