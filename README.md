@@ -67,6 +67,8 @@ hold_ms = 250                                 # a key held this long stops on re
 paste = true                                  # false: the phrases are only in the event stream
 ```
 
+Rules per application are `[[rule]]` tables, none by default: see "Rules per application".
+
 ## Using it
 
 ```sh
@@ -118,6 +120,64 @@ pressed with it, the shortcut would be another one.
 It needs Hyprland with its Lua API (it is asked which window has the focus and which keys are
 down), `wtype`, and a compositor with the Wayland data-control protocol. `vocaline start
 --no-paste`, or `paste = false`, leaves the phrases in the event stream only.
+
+## Rules per application
+
+What you want after a dictation depends on where you dictate: a chat sends it, a terminal runs it,
+an assistant only listens. A rule says so for a window class (`hyprctl activewindow` shows it):
+
+```toml
+[[rule]]
+name = "terminal"
+class = "foot"           # case ignored; * stands for any run of characters
+enter = true             # press Enter once, after the paste
+drop_period = true       # no period at the end of the pasted text
+
+[[rule]]
+name = "chat"
+class = "org.example.*"
+enter = true
+vocabulary = ["foo bar -> Foobar"]   # same lines as vocabulary.txt, added to it
+
+[[rule]]
+name = "assistant"
+paste = false            # nothing is pasted, the phrases stay in the event stream
+```
+
+- **The first rule whose `class` matches wins**; a window that matches none gets the defaults
+  (paste, no Enter, the text as heard). The class is the one of the window that had the focus
+  when the dictation **started**, the same window the text is pasted in, not where the focus is
+  when it stops.
+- **`paste`** (default `true`), **`enter`** (default `false`) and **`drop_period`** (default
+  `false`) are all a rule can change about the paste. `enter` presses Return once, after the one
+  paste (and after the application has had time to read it, so a terminal runs the whole line);
+  it presses nothing when nothing was pasted. `drop_period` removes the period that ends the
+  whole text, not the ones inside it, and leaves `?`, `!` and an ellipsis alone. The `final`
+  events and `vocaline last` keep the phrases as heard: only the paste changes.
+- **`vocabulary`** adds lines (the format of the next section) to the common vocabulary, for the
+  dictations this rule governs; on the same heard words, the rule wins. It corrects the
+  partials, the finals and the paste, like the common one.
+- A rule needs a one-word `name`, used once. Without a `class` it never matches a window: it is
+  only reached by name. A mistake in a rule (unknown key, bad vocabulary line, repeated name)
+  stops the daemon at startup with the rule named.
+- With `paste = false` under `[output]`, or `start --no-paste`, nothing is pasted and the
+  window is not asked: no rule is chosen by window, and `--no-paste` takes no `--rule`. Under
+  `[output]`, a forced rule still adds its vocabulary.
+
+### Forcing a rule
+
+`vocaline start --rule terminal` makes the rule of that name govern the dictation, whatever the
+window, for a key bound to one use. So does `vocaline press --rule terminal`, because the key of
+the previous section is a `press` / `release` pair and the rule is only needed when the key
+starts the dictation (`release` takes none):
+
+```
+bind = SUPER, T, exec, vocaline press --rule terminal
+bindr = SUPER, T, exec, vocaline release
+```
+
+A name that is not a rule is refused before the microphone opens, and said in an `error` event.
+It governs that one dictation only. `toggle` takes no rule: use `start --rule` and `stop`.
 
 ## Your own vocabulary
 
