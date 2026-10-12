@@ -228,3 +228,30 @@ and `teach` works with no daemon running.
 `vocaline last` prints the last 20 final phrases of the session, as they were shown, one per
 line. They are kept in the daemon's memory only: never written to disk or to a log, and gone when
 the daemon stops.
+
+## Statistics
+
+```sh
+vocaline stats           # today, the last 7 days, all time
+vocaline stats --json    # the same, as one JSON object, for a program
+```
+
+For each period: the dictations, the words, the minutes heard, the time from the stop to the
+paste (median and maximum), and the same by application (the class of the window the dictation
+started in) and, for the last 7 days, by day. A dictation that pastes nothing (`start --no-paste`,
+`paste = false`) does not ask for the window, so it is counted under `unknown`, like one whose
+window the desktop could not name. A dictation in which nothing was heard is not counted.
+
+The daemon appends one line per dictation to `$XDG_DATA_HOME/vocaline/stats.jsonl` (usually
+`~/.local/share/vocaline/stats.jsonl`) when the dictation ends; `stats` reads that file itself, so
+it works with no daemon running. Removing the package leaves it, like the configuration; delete
+it to start over.
+
+**No dictated text is stored**: a line holds the day, the class of the window, a word count, the
+audio duration in milliseconds and the time to paste in milliseconds. Not a word of the text,
+not even a window title. If the file cannot be written, an `error` event says so and the
+dictation is pasted all the same.
+
+The time to paste runs from the stop (second tap, release, `stop`) to the moment the text is
+handed to the output, which then pastes it in a few tens of milliseconds more. The minutes are
+the time the microphone was heard, silences included.
