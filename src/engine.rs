@@ -30,6 +30,12 @@ pub enum EngineEvent {
 pub type Sink = Box<dyn Fn(EngineEvent) + Send + Sync>;
 
 pub trait Engine: Send + Sync {
+    /// Whether what the engine needs is there, asked before a dictation starts; the error
+    /// says what is missing and how to get it. An engine with nothing to check says nothing.
+    fn check(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Loads the model and opens a stream of 16 kHz mono audio; its events go to `sink`.
     fn open(&self, sink: Sink) -> io::Result<Box<dyn EngineInput>>;
 }
