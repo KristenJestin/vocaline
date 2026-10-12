@@ -1,0 +1,71 @@
+# Builds the checkout this file sits in, not a download of it: CI and a local `makepkg` package
+# exactly the commit they stand on.
+
+pkgname=vocaline
+pkgver=0.0.0
+pkgrel=1
+pkgdesc='Local dictation: the phrase shows while you speak, and is pasted when you stop'
+arch=(x86_64)
+url='https://github.com/KristenJestin/vocaline'
+# CrispASR is MIT, the OpenBLAS it bundles BSD-3-Clause.
+license=(MIT BSD-3-Clause)
+depends=(
+  gcc-libs glibc
+  # The GCC runtime CrispASR links: the system's copy instead of the one in its archive.
+  libgomp libgfortran libquadmath
+  curl      # vocaline setup
+  pipewire  # pw-record
+  wtype     # the paste shortcut
+)
+optdepends=(
+  'cuda: the cuda backend, on an NVIDIA GPU'
+  'hyprland: pasting where the dictation started'
+)
+makedepends=(cargo git)
+# The engine is a prebuilt release: stripping it gains nothing and risks breaking it.
+options=(!strip !debug)
+
+_crispasr=0.8.42
+_bundle=crispasr-linux-x86_64-cuda13
+source=("crispasr-$_crispasr-cuda13.tar.gz::https://github.com/CrispStrobe/CrispASR/releases/download/v$_crispasr/$_bundle.tar.gz")
+sha256sums=('8bfb828151fd3c9c15e49bbd5a7946ccb1c332be68eb9b3b029fcc4e3e4ce4d2')
+
+_root=$(realpath "$startdir/../..")
+
+# 0.1.0.r42.g1a2b3c4: the version of Cargo.toml, then which commit was built.
+pkgver() {
+  cd "$_root"
+  local version
+  version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+  printf '%s.r%s.g%s' "$version" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cargo fetch --locked --manifest-path "$_root/Cargo.toml" --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+  export CARGO_TARGET_DIR="$srcdir/target"
+  export VOCALINE_ENGINE=/usr/lib/vocaline/crispasr/crispasr
+  cargo build --release --frozen --manifest-path "$_root/Cargo.toml"
+}
+
+check() {
+  export CARGO_TARGET_DIR="$srcdir/target"
+  export VOCALINE_ENGINE=/usr/lib/vocaline/crispasr/crispasr
+  cargo test --release --frozen --manifest-path "$_root/Cargo.toml"
+}
+
+package() {
+  install -Dm755 "$srcdir/target/release/vocaline" "$pkgdir/usr/bin/vocaline"
+  install -Dm644 "$_root/packaging/vocaline.service" "$pkgdir/usr/lib/systemd/user/vocaline.service"
+  install -Dm644 -t "$pkgdir/usr/share/doc/vocaline" "$_root/README.md" "$_root/docs/events.md"
+
+  # The engine keeps its archive's layout: crispasr finds its libraries beside itself.
+  local engine="$pkgdir/usr/lib/vocaline/crispasr"
+  install -d "$engine"
+  cp -a "$srcdir/$_bundle/." "$engine/"
+  rm "$engine"/{libgomp.so.1,libgfortran.so.5,libquadmath.so.0}
+  install -d "$pkgdir/usr/share/licenses/$pkgname/crispasr"
+  mv "$engine"/{LICENSE,THIRD_PARTY_NOTICES.txt} "$pkgdir/usr/share/licenses/$pkgname/crispasr/"
+}
