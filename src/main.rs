@@ -38,9 +38,15 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
+    // The version needs no session: it answers outside one, in a build script or over ssh.
+    if cli == Cli::Version {
+        println!("{}", cli::VERSION);
+        return Ok(());
+    }
     let dirs = Dirs::from_env()?;
     match cli {
         Cli::Help => println!("{}", cli::USAGE),
+        Cli::Version => unreachable!("answered above"),
         Cli::Daemon { audio_file } => run_daemon(&dirs, audio_file.as_deref())?,
         Cli::Command(command) => {
             println!("{}", cli::request(&dirs.socket(), command.word())?.name());

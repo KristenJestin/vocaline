@@ -6,6 +6,13 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
+/// The package passes its own version, which names the commit it was built from
+/// (`0.1.0.r3.g1a2b3c4`); a plain `cargo build` says the one of Cargo.toml.
+pub const VERSION: &str = match option_env!("VOCALINE_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 pub const USAGE: &str = "\
 usage: vocaline <command>
 
@@ -23,7 +30,8 @@ usage: vocaline <command>
   teach \"<heard>\" \"<wanted>\"  add an entry to the vocabulary: what the model writes, and
                                what you want instead (read from the next dictation on)
   setup                        download the model and the VAD model the configuration names,
-                               if they are missing; their size is shown first";
+                               if they are missing; their size is shown first
+  --version                    print the version, which names the commit it was built from";
 
 #[derive(Debug, PartialEq)]
 pub enum Cli {
@@ -33,6 +41,7 @@ pub enum Cli {
     Last,
     Teach { heard: String, wanted: String },
     Setup,
+    Version,
     Help,
 }
 
@@ -53,6 +62,7 @@ impl Cli {
             }),
             ["setup"] => Ok(Cli::Setup),
             ["help" | "--help" | "-h"] => Ok(Cli::Help),
+            ["--version" | "-V"] => Ok(Cli::Version),
             [word] => Command::parse(word)
                 .map(Cli::Command)
                 .ok_or_else(|| format!("unknown command: {word}")),
@@ -174,6 +184,8 @@ mod tests {
         assert_eq!(Cli::parse(&args(&["watch"])), Ok(Cli::Watch));
         assert_eq!(Cli::parse(&args(&["setup"])), Ok(Cli::Setup));
         assert_eq!(Cli::parse(&args(&["--help"])), Ok(Cli::Help));
+        assert_eq!(Cli::parse(&args(&["--version"])), Ok(Cli::Version));
+        assert_eq!(Cli::parse(&args(&["-V"])), Ok(Cli::Version));
         assert_eq!(Cli::parse(&args(&["last"])), Ok(Cli::Last));
         assert_eq!(
             Cli::parse(&args(&["teach", "foo bar", "Foobar"])),
@@ -182,6 +194,13 @@ mod tests {
                 wanted: "Foobar".into()
             })
         );
+    }
+
+    #[test]
+    fn a_build_given_no_version_says_the_one_of_cargo_toml() {
+        if option_env!("VOCALINE_VERSION").is_none() {
+            assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+        }
     }
 
     #[test]
