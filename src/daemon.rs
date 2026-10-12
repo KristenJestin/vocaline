@@ -124,8 +124,9 @@ impl Handle {
 /// What tells the time to the key's hold-or-tap rule; a test moves it by hand.
 pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
-/// Starts the daemon's thread. Each final phrase goes to `paste`, if any. A key held for `hold`
-/// or more stops the dictation it started when it is released.
+/// Starts the daemon's thread. The finals of a dictation go to `paste`, if any, in one piece
+/// once it has stopped. A key held for `hold` or more stops the dictation it started when it
+/// is released.
 pub fn spawn(
     mic: Arc<dyn Microphone>,
     engine: Arc<dyn Engine>,
@@ -147,6 +148,7 @@ pub fn spawn(
         partial: Steady::default(),
         paste,
         pasting: false,
+        dictated: Vec::new(),
         hold,
         clock,
         pressed_at: None,
@@ -177,6 +179,8 @@ struct Core {
     paste: Option<Box<dyn Paste>>,
     /// The current dictation's finals are pasted.
     pasting: bool,
+    /// The finals of the current dictation, kept for the single paste that follows its end.
+    dictated: Vec<String>,
     hold: Duration,
     clock: Clock,
     /// When the key went down and started the dictation; none for a press that stopped it.
@@ -288,6 +292,7 @@ impl Core {
         };
         thread::spawn(move || pump.run());
         self.pasting = paste && self.paste.is_some();
+        self.dictated.clear();
         if self.pasting
             && let Some(output) = &self.paste
         {
@@ -320,10 +325,8 @@ impl Core {
             EngineEvent::Final { utterance, text } => {
                 let utterance = self.utterance(utterance);
                 self.open_utterance = None;
-                if self.pasting
-                    && let Some(output) = &self.paste
-                {
-                    output.phrase(text.clone());
+                if self.pasting {
+                    self.dictated.push(text.clone());
                 }
                 self.bus.publish(&Event::Final { utterance, text });
             }
@@ -334,8 +337,27 @@ impl Core {
                 }
                 // The engine may have failed while the microphone is still open.
                 self.stop.store(true, Ordering::SeqCst);
+                self.paste_dictation();
                 self.set(State::Idle);
             }
+        }
+    }
+
+    /// Hands the finals of the dictation that ended to the output, as one text. The end of the
+    /// engine's stream, not the stop command, is the moment: the last open utterance is final
+    /// only by then, and it comes once, so the paste does too.
+    fn paste_dictation(&mut self) {
+        let finals = std::mem::take(&mut self.dictated);
+        let text = finals
+            .iter()
+            .map(|text| text.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !text.is_empty()
+            && let Some(output) = &self.paste
+        {
+            output.phrase(text);
         }
     }
 

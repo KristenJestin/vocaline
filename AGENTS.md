@@ -7,7 +7,8 @@ to this file: there is one contract, not two that drift apart.
 
 Vocaline is a local dictation tool for Linux (Wayland, Hyprland), written in Rust. While you
 speak, the phrase being heard is shown as it forms (grey, still changing); at each pause the
-phrase is frozen and pasted where you were typing. Nothing leaves the machine.
+phrase is frozen; when the dictation stops, all its phrases are pasted at once where you were
+typing. Nothing leaves the machine.
 
 - **The engine** is CrispASR (C++/ggml, MIT) running NVIDIA Parakeet TDT 0.6B v3 (multilingual,
   very good French), on the GPU through CUDA where there is one. The speech is cut into
