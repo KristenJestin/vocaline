@@ -1939,3 +1939,39 @@ fn on_the_same_heard_words_the_rule_vocabulary_wins_over_the_common_one() {
     dictate(&daemon, Command::Start);
     assert_eq!(handed(&paste)[1], Handed::Phrase("ouvre foo_bar".into()));
 }
+
+#[test]
+fn a_rule_is_forced_through_the_socket_and_an_unknown_one_is_told() {
+    let path = socket_path("rule.sock");
+    let paste = FakePaste::in_window("org.example.Chat");
+    let daemon = ruled_daemon(saying("ls."), &paste, vec![terminal()], no_vocabulary());
+    let listener = bind(&path).unwrap();
+    thread::spawn(move || serve(listener, daemon));
+
+    assert_eq!(
+        ask(&path, "start --rule nope"),
+        "{\"error\":\"no rule is named nope\"}\n"
+    );
+    assert_eq!(
+        ask(&path, "start --rule terminal"),
+        "{\"state\":\"loading\"}\n"
+    );
+    assert_eq!(ask(&path, "stop"), "{\"state\":\"stopping\"}\n");
+    wait_until("the paste", || handed(&paste).len() == 3);
+    assert_eq!(
+        handed(&paste),
+        [Handed::Begin, Handed::Phrase("ls".into()), Handed::Enter]
+    );
+}
+
+#[test]
+fn a_rule_name_with_a_space_or_nothing_is_not_a_command() {
+    for word in [
+        "start --rule",
+        "start --rule ",
+        "start --rule a b",
+        "press --rule  a",
+    ] {
+        assert_eq!(Command::parse(word), None, "{word:?}");
+    }
+}
