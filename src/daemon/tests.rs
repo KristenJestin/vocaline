@@ -73,6 +73,9 @@ struct FakeEngine {
     on_finish: Vec<EngineEvent>,
     hold_end: bool,
     fail: bool,
+    /// Only the first dictation hears the script: the next ones are silent.
+    first_only: bool,
+    opens: AtomicUsize,
     sink: Mutex<Option<Arc<Sink>>>,
 }
 
@@ -98,9 +101,18 @@ impl Engine for FakeEngine {
         }
         let sink = Arc::new(sink);
         *self.sink.lock().unwrap() = Some(Arc::clone(&sink));
+        let silent = self.first_only && self.opens.fetch_add(1, Ordering::SeqCst) > 0;
         let mut input = FakeInput {
-            script: self.script.clone().into(),
-            on_finish: self.on_finish.clone(),
+            script: if silent {
+                VecDeque::new()
+            } else {
+                self.script.clone().into()
+            },
+            on_finish: if silent {
+                Vec::new()
+            } else {
+                self.on_finish.clone()
+            },
             hold_end: self.hold_end,
             received: 0,
             sink,
@@ -368,6 +380,32 @@ fn keyed_daemon(engine: FakeEngine) -> (Handle, FakeClock, Arc<FakeMic>) {
     let mic = Arc::new(FakeMic::default());
     let handle = spawn(mic.clone(), Arc::new(engine), None, HOLD, clock.clock());
     (handle, clock, mic)
+}
+
+/// A daemon with the fake clock and a fake output, for a key that pastes.
+fn keyed_pasting_daemon(engine: FakeEngine) -> (Handle, FakeClock, FakePaste) {
+    let clock = FakeClock::new();
+    let paste = FakePaste::default();
+    let handle = spawn(
+        Arc::new(FakeMic::default()),
+        Arc::new(engine),
+        Some(Box::new(paste.clone())),
+        HOLD,
+        clock.clock(),
+    );
+    (handle, clock, paste)
+}
+
+/// Two phrases closed by their pauses, nothing left open when the audio ends.
+fn two_closed_phrases() -> FakeEngine {
+    FakeEngine {
+        script: vec![
+            (0, EngineEvent::Ready),
+            (1_600, final_(1, "Bonjour.")),
+            (3_200, final_(2, "Ça va ?")),
+        ],
+        ..FakeEngine::default()
+    }
 }
 
 fn ready_engine() -> FakeEngine {
@@ -990,25 +1028,154 @@ fn press_and_release_go_through_the_socket() {
 }
 
 #[test]
-fn each_final_is_handed_to_the_output_after_the_dictation_began() {
+fn nothing_is_pasted_while_the_key_is_held() {
+    let (daemon, clock, paste) = keyed_pasting_daemon(two_closed_phrases());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Press).unwrap();
+    watcher.skip_to(&ev_final(2, "Ça va ?"));
+    clock.advance(ms(2_000));
+    // The stream has both finals; the window has nothing yet.
+    assert_eq!(*paste.0.lock().unwrap(), [Handed::Begin]);
+}
+
+#[test]
+fn the_whole_dictation_is_pasted_once_on_release() {
+    let (daemon, clock, paste) = keyed_pasting_daemon(two_closed_phrases());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Press).unwrap();
+    watcher.skip_to(&ev_final(2, "Ça va ?"));
+    clock.advance(ms(2_000));
+    assert_eq!(daemon.command(Command::Release), Ok(State::Stopping));
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        *paste.0.lock().unwrap(),
+        [Handed::Begin, Handed::Phrase("Bonjour. Ça va ?".into())]
+    );
+}
+
+#[test]
+fn a_tapped_dictation_is_pasted_once_on_the_second_tap() {
+    let (daemon, clock, paste) = keyed_pasting_daemon(two_closed_phrases());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Press).unwrap();
+    clock.advance(ms(80));
+    daemon.command(Command::Release).unwrap();
+    watcher.skip_to(&ev_final(2, "Ça va ?"));
+    assert_eq!(*paste.0.lock().unwrap(), [Handed::Begin]);
+
+    clock.advance(ms(10_000));
+    assert_eq!(daemon.command(Command::Press), Ok(State::Stopping));
+    clock.advance(ms(80));
+    daemon.command(Command::Release).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        *paste.0.lock().unwrap(),
+        [Handed::Begin, Handed::Phrase("Bonjour. Ça va ?".into())]
+    );
+}
+
+#[test]
+fn the_last_utterance_open_at_the_stop_is_in_the_paste() {
     let (daemon, paste) = pasting_daemon(two_phrases());
     let watcher = Watcher::on(&daemon);
     daemon.command(Command::Start).unwrap();
     watcher.skip_to(&ev_partial(2, "Ça"));
+    assert_eq!(*paste.0.lock().unwrap(), [Handed::Begin]);
     daemon.command(Command::Stop).unwrap();
     watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        *paste.0.lock().unwrap(),
+        [Handed::Begin, Handed::Phrase("Bonjour. Ça va ?".into())]
+    );
+}
+
+#[test]
+fn a_dictation_with_no_final_pastes_nothing() {
+    let (daemon, paste) = pasting_daemon(ready_engine());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&state(State::Listening));
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(*paste.0.lock().unwrap(), [Handed::Begin]);
+}
+
+#[test]
+fn a_dictation_stopped_while_loading_pastes_nothing_of_the_previous_one() {
+    let engine = FakeEngine {
+        script: vec![(0, EngineEvent::Ready), (1_600, final_(1, "Bonjour."))],
+        first_only: true,
+        ..FakeEngine::default()
+    };
+    let (daemon, paste) = pasting_daemon(engine);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&ev_final(1, "Bonjour."));
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Idle));
+
+    // The engine of the second dictation never says it is ready.
+    daemon.command(Command::Start).unwrap();
+    assert_eq!(daemon.command(Command::Stop), Ok(State::Stopping));
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(daemon.command(Command::Status), Ok(State::Idle));
     assert_eq!(
         *paste.0.lock().unwrap(),
         [
             Handed::Begin,
             Handed::Phrase("Bonjour.".into()),
-            Handed::Phrase("Ça va ?".into()),
+            Handed::Begin
         ]
     );
 }
 
 #[test]
-fn start_no_paste_hands_nothing_to_the_output_and_the_stream_has_the_finals() {
+fn the_finals_are_joined_by_one_space_whatever_the_engine_puts_around_them() {
+    let engine = FakeEngine {
+        on_finish: vec![
+            final_(1, " Bonjour. "),
+            final_(2, "   "),
+            final_(3, " Ça va ?"),
+        ],
+        ..FakeEngine::default()
+    };
+    let (daemon, paste) = pasting_daemon(engine);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Stopping));
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        *paste.0.lock().unwrap(),
+        [Handed::Begin, Handed::Phrase("Bonjour. Ça va ?".into())]
+    );
+}
+
+#[test]
+fn an_engine_that_fails_after_some_finals_still_has_them_pasted_once() {
+    let engine = FakeEngine {
+        on_finish: vec![
+            final_(1, "Bonjour."),
+            EngineEvent::Ended(Err("the engine died".into())),
+        ],
+        ..FakeEngine::default()
+    };
+    let (daemon, paste) = pasting_daemon(engine);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Stopping));
+    watcher.skip_to(&state(State::Idle));
+    // The fake then ends its stream a second time, as a late duplicate: nothing more is pasted.
+    assert_eq!(daemon.command(Command::Status), Ok(State::Idle));
+    assert_eq!(
+        *paste.0.lock().unwrap(),
+        [Handed::Begin, Handed::Phrase("Bonjour.".into())]
+    );
+}
+
+#[test]
+fn no_paste_still_pastes_nothing() {
     let (daemon, paste) = pasting_daemon(two_phrases());
     let watcher = Watcher::on(&daemon);
     assert_eq!(daemon.command(Command::StartNoPaste), Ok(State::Loading));
