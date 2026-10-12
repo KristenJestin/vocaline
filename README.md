@@ -5,45 +5,59 @@ Parakeet through CrispASR, on the GPU when there is one. Nothing leaves the mach
 
 Work in progress: see the issues. Agents read `AGENTS.md`.
 
-## Getting the engine and the models
+## Installing it (Arch Linux)
 
-Vocaline drives [CrispASR](https://github.com/CrispStrobe/CrispASR) (MIT) as a process. Nothing
-of it is in this repository.
+CI builds the package: the `dev-latest` pre-release follows the integration branch, each `v*`
+release a version. A release from the tag `vX.Y.Z` is version `X.Y.Z` (the tag must match
+`Cargo.toml`); any other build is `X.Y.Z.rN.gHASH`, N commits after the last release tag
+(`0.0.0` before the first), so pacman sees a dev build as newer than the release it follows
+and older than the next one. `vocaline --version` prints the same string.
 
-1. **CrispASR**: take the Linux bundle of a release (0.8.42 is the one tested), for example
-   `crispasr-linux-x86_64-cuda13.tar.gz` for an NVIDIA GPU with CUDA 13,
-   `crispasr-linux-x86_64-vulkan.tar.gz` for Vulkan, `crispasr-linux-x86_64.tar.gz` for the
-   CPU. Unpack it anywhere: the `crispasr` binary finds its libraries next to itself.
+```sh
+gh release download dev-latest -R KristenJestin/vocaline -p '*.pkg.tar.zst'   # or a v* tag
+sudo pacman -U vocaline-*.pkg.tar.zst
+```
 
-   ```sh
-   gh release download v0.8.42 -R CrispStrobe/CrispASR -p crispasr-linux-x86_64-cuda13.tar.gz
-   tar xzf crispasr-linux-x86_64-cuda13.tar.gz
-   ```
+It installs `vocaline`, a systemd user unit, this documentation, and the engine under
+`/usr/lib/vocaline/crispasr`: the Linux CUDA 13 bundle of [CrispASR](https://github.com/CrispStrobe/CrispASR)
+0.8.42 (MIT), which also holds the CPU backends. For the `cuda` backend, install `cuda` too.
+The `vulkan` backend is not in it: point `command` at CrispASR's Vulkan bundle (below).
+Removing the package leaves only your configuration and your models.
 
-2. **Parakeet TDT 0.6B v3, quantised q8_0** (about 670 MB), published by CrispASR's author:
+Then, as yourself:
 
-   ```sh
-   mkdir -p ~/.local/share/vocaline/models
-   curl -L -o ~/.local/share/vocaline/models/parakeet-tdt-0.6b-v3-q8_0.gguf \
-     https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF/resolve/main/parakeet-tdt-0.6b-v3-q8_0.gguf
-   ```
+```sh
+vocaline setup                                   # downloads the models, their size shown first
+systemctl --user enable --now vocaline.service   # the daemon, with the graphical session
+```
 
-   The same repository has `q5_0` and `q4_k` for a smaller machine. From the full
-   `parakeet-tdt-0.6b-v3.gguf`, `crispasr-quantize` makes any of them.
+`vocaline setup` downloads the model and the VAD model the configuration names into
+`~/.local/share/vocaline/models`, checks their sha256, and leaves alone a file already there:
+Parakeet TDT 0.6B v3 q8_0 (674 MB) and Silero VAD v6.2.0 (0.9 MB) by default. It knows
+`parakeet-tdt-0.6b-v3-q8_0.gguf`, `-q5_0`, `-q4_k` (for a smaller machine) and
+`canary-1b-v2-q8_0.gguf`; another file, put it in the models folder yourself.
 
-   Parakeet guesses the language by itself and ignores `language`: a short phrase can come out
-   in English (`allô` → `Hello?`). **Canary 1B v2** obeys `language`, at a cost: on the same
-   GPU it takes about 3.5 times the CPU while you speak, 0.4 GB more VRAM and 0.15 s more
-   before each final. To use it, download it the same way and set `model`:
+The unit is bound to `graphical-session.target`, which Hyprland started through `uwsm`
+reaches. The daemon pastes through Wayland and asks Hyprland which window has the focus: the
+user manager must have `WAYLAND_DISPLAY` and `HYPRLAND_INSTANCE_SIGNATURE` in its environment
+(`uwsm` does it; otherwise `systemctl --user import-environment WAYLAND_DISPLAY
+HYPRLAND_INSTANCE_SIGNATURE` at login).
 
-   ```sh
-   curl -L -o ~/.local/share/vocaline/models/canary-1b-v2-q8_0.gguf \
-     https://huggingface.co/cstr/canary-1b-v2-GGUF/resolve/main/canary-1b-v2-q8_0.gguf
-   ```
+## Choosing a model
 
-3. **Silero VAD**: nothing to do. With `vad_model = "auto"` (the default), CrispASR downloads
-   `ggml-silero-v6.2.0.bin` from `ggml-org/whisper-vad` on Hugging Face once and keeps it in
-   `~/.cache/crispasr`. Set `vad_model` to a path to use a file of your own.
+Parakeet guesses the language by itself and ignores `language`: a short phrase can come out
+in English (`allô` → `Hello?`). **Canary 1B v2** obeys `language`, at a cost: on the same GPU
+it takes about 3.5 times the CPU while you speak, 0.4 GB more VRAM and 0.15 s more before each
+final. To use it, set `model = "canary-1b-v2-q8_0.gguf"` and run `vocaline setup` again.
+
+## Building it yourself
+
+`cargo build --release` gives a `vocaline` that looks `crispasr` up in `PATH`; set `command`
+to use another one. Take the Linux bundle of a CrispASR release (0.8.42 is the one tested):
+`crispasr-linux-x86_64-cuda13.tar.gz` for an NVIDIA GPU with CUDA 13,
+`crispasr-linux-x86_64-vulkan.tar.gz` for Vulkan, `crispasr-linux-x86_64.tar.gz` for the CPU,
+and unpack it anywhere: the `crispasr` binary finds its libraries next to itself. The package
+itself is built by `makepkg` in `packaging/arch`.
 
 ## Configuration
 
@@ -52,9 +66,9 @@ optional, these are the defaults:
 
 ```toml
 [engine]
-command = "crispasr"                          # the binary: a path, or a name in PATH
+command = "/usr/lib/vocaline/crispasr/crispasr" # the package's engine ("crispasr", from PATH, built by hand)
 model = "parakeet-tdt-0.6b-v3-q8_0.gguf"      # or canary-1b-v2-q8_0.gguf; relative: read from ~/.local/share/vocaline/models
-vad_model = "auto"
+vad_model = "ggml-silero-v6.2.0.bin"          # relative: read from the models folder; "auto": CrispASR fetches it
 backend = "cuda"                              # cuda, vulkan or cpu
 language = "fr"
 partial_ms = 400                              # the open phrase is decoded again this often
@@ -72,7 +86,7 @@ Rules per application are `[[rule]]` tables, none by default: see "Rules per app
 ## Using it
 
 ```sh
-vocaline daemon &      # owns the microphone (PipeWire, through pw-record) and the engine
+vocaline daemon &      # owns the microphone (PipeWire, through pw-record) and the engine; or the unit
 vocaline watch         # the event stream, one JSON object per line (docs/events.md)
 vocaline start         # or stop, toggle, status
 ```
@@ -94,6 +108,9 @@ bindr = SUPER, A, exec, vocaline release
 Hold the key while you speak and release it to stop. Or tap it (shorter than `hold_ms`): it keeps
 listening, and the next press stops it. Either way, the phrase being spoken is finalised first.
 `start`, `stop` and `toggle` stay for a button or another program.
+
+Showing the phrase while you speak is the desktop's job: any program (a bar, a notification, a
+voice assistant) can read `vocaline watch`.
 
 ## Pasting
 

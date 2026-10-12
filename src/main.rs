@@ -6,6 +6,7 @@ mod engine;
 mod events;
 mod output;
 mod rules;
+mod setup;
 mod steady;
 mod vocabulary;
 
@@ -38,9 +39,15 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
+    // The version needs no session: it answers outside one, in a build script or over ssh.
+    if cli == Cli::Version {
+        println!("{}", cli::VERSION);
+        return Ok(());
+    }
     let dirs = Dirs::from_env()?;
     match cli {
         Cli::Help => println!("{}", cli::USAGE),
+        Cli::Version => unreachable!("answered above"),
         Cli::Daemon { audio_file } => run_daemon(&dirs, audio_file.as_deref())?,
         Cli::Command(command) => {
             println!("{}", cli::request(&dirs.socket(), &command.word())?.name());
@@ -55,6 +62,15 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("{} -> {}", heard.trim(), wanted.trim());
         }
         Cli::Watch => cli::watch(&dirs.socket(), &mut std::io::stdout().lock())?,
+        Cli::Setup => {
+            let config = Config::load(&dirs)?;
+            setup::setup(
+                &setup::wanted(&config.engine),
+                setup::CATALOGUE,
+                &setup::Curl,
+                &mut std::io::stdout().lock(),
+            )?;
+        }
     }
     Ok(())
 }

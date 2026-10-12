@@ -220,6 +220,7 @@ mod tests {
         let config = EngineConfig {
             command: "/opt/crispasr".into(),
             model: "/models/p.gguf".into(),
+            vad_model: "auto".into(),
             partial_ms: 300,
             final_silence_ms: 900,
             ..EngineConfig::default()

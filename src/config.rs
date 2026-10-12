@@ -4,6 +4,14 @@ use crate::rules::{self, Rule};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// The engine binary when the configuration names none. The Arch package bundles CrispASR in
+/// its own folder and sets `VOCALINE_ENGINE` at build time, so it never clashes with another
+/// `crispasr` in `PATH`; a plain `cargo build` looks it up in `PATH`.
+pub const DEFAULT_ENGINE: &str = match option_env!("VOCALINE_ENGINE") {
+    Some(path) => path,
+    None => "crispasr",
+};
+
 /// The folders Vocaline uses, from the XDG variables.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dirs {
@@ -95,7 +103,7 @@ pub struct EngineConfig {
     /// The GGUF model, Parakeet or Canary: crispasr knows which from the file. A relative path
     /// is read from `$XDG_DATA_HOME/vocaline/models`.
     pub model: PathBuf,
-    /// The Silero VAD model, or `auto` to let CrispASR fetch and cache it.
+    /// The Silero VAD model, read like `model`; `auto` lets CrispASR fetch and cache it itself.
     pub vad_model: String,
     pub backend: Backend,
     pub language: String,
@@ -108,9 +116,9 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> EngineConfig {
         EngineConfig {
-            command: PathBuf::from("crispasr"),
+            command: PathBuf::from(DEFAULT_ENGINE),
             model: PathBuf::from("parakeet-tdt-0.6b-v3-q8_0.gguf"),
-            vad_model: "auto".into(),
+            vad_model: "ggml-silero-v6.2.0.bin".into(),
             backend: Backend::Cuda,
             language: "fr".into(),
             partial_ms: 400,
@@ -151,12 +159,12 @@ impl Config {
 
     fn parse(text: &str, dirs: &Dirs) -> Result<Config, String> {
         let mut config: Config = toml::from_str(text).map_err(|e| e.to_string())?;
-        let model = expand_home(&config.engine.model);
-        config.engine.model = if model.is_absolute() {
-            model
-        } else {
-            dirs.data.join("models").join(model)
-        };
+        let models = dirs.data.join("models");
+        config.engine.model = models.join(expand_home(&config.engine.model));
+        if config.engine.vad_model != "auto" {
+            let vad = models.join(expand_home(Path::new(&config.engine.vad_model)));
+            config.engine.vad_model = vad.to_string_lossy().into_owned();
+        }
         config.engine.command = expand_home(&config.engine.command);
         rules::check(&config.rule)?;
         Ok(config)
@@ -187,12 +195,15 @@ mod tests {
     fn defaults_are_the_values_of_the_issue() {
         let config = Config::parse("", &dirs()).unwrap();
         let engine = config.engine;
-        assert_eq!(engine.command, PathBuf::from("crispasr"));
+        assert_eq!(engine.command, PathBuf::from(DEFAULT_ENGINE));
         assert_eq!(
             engine.model,
             PathBuf::from("/data/vocaline/models/parakeet-tdt-0.6b-v3-q8_0.gguf")
         );
-        assert_eq!(engine.vad_model, "auto");
+        assert_eq!(
+            engine.vad_model,
+            "/data/vocaline/models/ggml-silero-v6.2.0.bin"
+        );
         assert_eq!(engine.backend, Backend::Cuda);
         assert_eq!(engine.language, "fr");
         assert_eq!(engine.partial_ms, 400);
@@ -284,6 +295,25 @@ mod tests {
         assert!(Config::parse(text, &dirs()).unwrap_err().contains("rule a"));
         let text = "[[rule]]\nname = \"a\"\n[[rule]]\nname = \"a\"";
         assert!(Config::parse(text, &dirs()).is_err());
+    }
+
+    #[test]
+    fn a_relative_vad_model_is_read_from_the_data_folder_and_auto_is_left_to_crispasr() {
+        let text = "[engine]\nvad_model = \"silero.bin\"";
+        let engine = Config::parse(text, &dirs()).unwrap().engine;
+        assert_eq!(engine.vad_model, "/data/vocaline/models/silero.bin");
+        let text = "[engine]\nvad_model = \"auto\"";
+        assert_eq!(
+            Config::parse(text, &dirs()).unwrap().engine.vad_model,
+            "auto"
+        );
+    }
+
+    #[test]
+    fn a_build_without_a_bundled_engine_looks_crispasr_up_in_path() {
+        if option_env!("VOCALINE_ENGINE").is_none() {
+            assert_eq!(DEFAULT_ENGINE, "crispasr");
+        }
     }
 
     #[test]
