@@ -147,6 +147,13 @@ struct Line {
 
 /// One line of `--stream-json`; anything else the engine prints is not an event.
 fn parse_line(line: &str) -> Option<EngineEvent> {
+    // After the audio ended and the open utterance was flushed as a final, crispasr prints one
+    // empty line, and only then unloads the model. Nothing else prints an empty line in a
+    // stream, and it comes after every final, so it tells that the last one is in. If it were
+    // held back until the exit, the paste would just wait for `Ended`, as it did.
+    if line.trim().is_empty() {
+        return Some(EngineEvent::Flushed);
+    }
     let line: Line = serde_json::from_str(line).ok()?;
     match line.kind.as_str() {
         "partial" => Some(EngineEvent::Partial {
@@ -168,7 +175,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn the_stream_json_lines_become_events() {
@@ -197,8 +204,13 @@ mod tests {
     }
 
     #[test]
+    fn the_empty_line_after_the_last_final_is_the_flush() {
+        assert_eq!(parse_line(""), Some(EngineEvent::Flushed));
+        assert_eq!(parse_line("  \t"), Some(EngineEvent::Flushed));
+    }
+
+    #[test]
     fn what_is_not_an_event_is_ignored() {
-        assert_eq!(parse_line(""), None);
         assert_eq!(parse_line("crispasr[stream]: reading raw s16le"), None);
         assert_eq!(parse_line(r#"{"type":"something-new"}"#), None);
     }
@@ -306,6 +318,13 @@ mod tests {
     }
 
     fn run(script_name: &str, script: &str, audio: &[i16]) -> Vec<EngineEvent> {
+        run_timed(script_name, script, audio)
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect()
+    }
+
+    fn run_timed(script_name: &str, script: &str, audio: &[i16]) -> Vec<(Instant, EngineEvent)> {
         let config = EngineConfig {
             command: fake_crispasr(script_name, script),
             ..EngineConfig::default()
@@ -321,7 +340,7 @@ mod tests {
         loop {
             let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let ended = matches!(event, EngineEvent::Ended(_));
-            events.push(event);
+            events.push((Instant::now(), event));
             if ended {
                 return events;
             }
@@ -353,6 +372,34 @@ mod tests {
                 EngineEvent::Ended(Ok(())),
             ]
         );
+    }
+
+    // Like crispasr: the flush of the open utterance, the empty line, then the model is unloaded
+    // before the process exits. The flush must reach the daemon without waiting for the exit.
+    #[test]
+    fn the_flush_is_told_before_the_engine_has_exited() {
+        let script = r#"
+            cat >/dev/null
+            echo '{"type":"final","utterance_id":1,"text":"Bonjour."}'
+            echo
+            sleep 1
+        "#;
+        let events = run_timed("flushes", script, &[1, 2, 3]);
+        let kinds: Vec<&EngineEvent> = events.iter().map(|(_, e)| e).collect();
+        assert_eq!(
+            kinds,
+            [
+                &EngineEvent::Ready,
+                &EngineEvent::Final {
+                    utterance: 1,
+                    text: "Bonjour.".into()
+                },
+                &EngineEvent::Flushed,
+                &EngineEvent::Ended(Ok(())),
+            ]
+        );
+        let wait = events[3].0 - events[2].0;
+        assert!(wait >= Duration::from_millis(500), "{wait:?}");
     }
 
     #[test]

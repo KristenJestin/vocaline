@@ -382,6 +382,11 @@ impl Core {
                 self.bus.publish(&Event::Final { utterance, text });
             }
             EngineEvent::Silence => self.bus.publish(&Event::Silence),
+            // The last final is in; the engine is only unloading its model now, which the
+            // paste does not wait for. The state stays `Stopping` until `Ended`. A flush while
+            // the dictation goes on is not one: pasting then would cut it in two.
+            EngineEvent::Flushed if self.state == State::Stopping => self.paste_dictation(),
+            EngineEvent::Flushed => {}
             EngineEvent::Ended(result) => {
                 if let Err(message) = result {
                     self.bus.publish(&Event::Error { message });
@@ -394,9 +399,10 @@ impl Core {
         }
     }
 
-    /// Hands the finals of the dictation that ended to the output, as one text. The end of the
-    /// engine's stream, not the stop command, is the moment: the last open utterance is final
-    /// only by then, and it comes once, so the paste does too.
+    /// Hands the finals of the dictation that ended to the output, as one text. The stop command
+    /// is not the moment: the last open utterance is final only once the engine has flushed it
+    /// (`Flushed`), or ended without saying so (`Ended`). The finals are taken, so whichever
+    /// comes second pastes nothing: the paste happens once.
     fn paste_dictation(&mut self) {
         let finals = std::mem::take(&mut self.dictated);
         let text = finals

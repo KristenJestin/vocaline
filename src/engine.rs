@@ -20,6 +20,9 @@ pub enum EngineEvent {
         text: String,
     },
     Silence,
+    /// Every final of the stream has been sent, whether or not the audio left one open: only the
+    /// engine's shutdown (unloading the model) is left. Engines that cannot tell never send it.
+    Flushed,
     /// The last event of a stream: after `finish`, or because the engine failed.
     Ended(Result<(), String>),
 }
@@ -34,6 +37,7 @@ pub trait Engine: Send + Sync {
 pub trait EngineInput: Send {
     fn write(&mut self, pcm: &[i16]) -> io::Result<()>;
 
-    /// No more audio: the open utterance is finalised, then `Ended` closes the stream.
+    /// No more audio: the open utterance is finalised, then `Flushed` if the engine says so,
+    /// then `Ended` closes the stream.
     fn finish(self: Box<Self>);
 }
