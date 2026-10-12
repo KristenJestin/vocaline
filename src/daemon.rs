@@ -10,10 +10,12 @@ use crate::engine::{Engine, EngineEvent, EngineInput};
 use crate::events::{Event, State, VERSION};
 use crate::output::Paste;
 use crate::steady::Steady;
+use crate::vocabulary::Vocabulary;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -22,6 +24,9 @@ use std::time::{Duration, Instant};
 /// A watcher that cannot take a line within this delay is dropped rather than slowing the
 /// daemon down.
 const WATCHER_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How many final phrases `last` can show.
+const LAST_PHRASES: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -74,6 +79,9 @@ pub struct Answer {
     pub state: Option<State>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The answer to `last`: the final phrases, oldest first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phrases: Option<Vec<String>>,
 }
 
 impl From<Reply> for Answer {
@@ -82,10 +90,12 @@ impl From<Reply> for Answer {
             Ok(state) => Answer {
                 state: Some(state),
                 error: None,
+                phrases: None,
             },
             Err(error) => Answer {
                 state: None,
                 error: Some(error),
+                phrases: None,
             },
         }
     }
@@ -94,6 +104,7 @@ impl From<Reply> for Answer {
 enum Message {
     Command(Command, mpsc::Sender<Reply>),
     Watch(Box<dyn Write + Send>),
+    Last(mpsc::Sender<Vec<String>>),
     /// From the dictation numbered by the first field.
     Engine(u64, EngineEvent),
     CaptureEnded(u64, Option<String>),
@@ -115,6 +126,13 @@ impl Handle {
             .map_err(|_| "the daemon has stopped".to_string())?
     }
 
+    /// The last final phrases of this session, oldest first.
+    pub fn last(&self) -> Vec<String> {
+        let (reply, answer) = mpsc::channel();
+        let _ = self.messages.send(Message::Last(reply));
+        answer.recv().unwrap_or_default()
+    }
+
     /// Sends the event stream to `watcher`, from a hello and the current state on.
     pub fn watch(&self, watcher: Box<dyn Write + Send>) {
         let _ = self.messages.send(Message::Watch(watcher));
@@ -126,13 +144,15 @@ pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// Starts the daemon's thread. The finals of a dictation go to `paste`, if any, in one piece
 /// once it has stopped. A key held for `hold` or more stops the dictation it started when it
-/// is released.
+/// is released. The vocabulary file is read again at each start, so a `teach` or an edit by
+/// hand applies to the next dictation.
 pub fn spawn(
     mic: Arc<dyn Microphone>,
     engine: Arc<dyn Engine>,
     paste: Option<Box<dyn Paste>>,
     hold: Duration,
     clock: Clock,
+    vocabulary_file: PathBuf,
 ) -> Handle {
     let (messages, inbox) = mpsc::channel();
     let mut core = Core {
@@ -152,6 +172,9 @@ pub fn spawn(
         hold,
         clock,
         pressed_at: None,
+        vocabulary_file,
+        vocabulary: Vocabulary::default(),
+        last: VecDeque::new(),
     };
     thread::spawn(move || {
         for message in inbox {
@@ -185,6 +208,11 @@ struct Core {
     clock: Clock,
     /// When the key went down and started the dictation; none for a press that stopped it.
     pressed_at: Option<Instant>,
+    vocabulary_file: PathBuf,
+    /// The vocabulary as read when the current dictation started.
+    vocabulary: Vocabulary,
+    /// The last finals, as shown; in memory only, for `last`.
+    last: VecDeque<String>,
 }
 
 impl Core {
@@ -192,6 +220,9 @@ impl Core {
         match message {
             Message::Command(command, reply) => {
                 let _ = reply.send(self.command(command));
+            }
+            Message::Last(reply) => {
+                let _ = reply.send(self.last.iter().cloned().collect());
             }
             Message::Watch(watcher) => self.bus.add(
                 watcher,
@@ -293,6 +324,7 @@ impl Core {
         thread::spawn(move || pump.run());
         self.pasting = paste && self.paste.is_some();
         self.dictated.clear();
+        self.read_vocabulary();
         if self.pasting
             && let Some(output) = &self.paste
         {
@@ -300,6 +332,17 @@ impl Core {
         }
         self.set(State::Loading);
         Ok(State::Loading)
+    }
+
+    /// A `teach` or an edit by hand is read from the next dictation on, not in the middle of one.
+    fn read_vocabulary(&mut self) {
+        let (vocabulary, problems) = Vocabulary::load(&self.vocabulary_file);
+        self.vocabulary = vocabulary;
+        if !problems.is_empty() {
+            self.bus.publish(&Event::Error {
+                message: problems.join("; "),
+            });
+        }
     }
 
     fn failed(&self, message: String) -> String {
@@ -316,15 +359,23 @@ impl Core {
                     self.set(State::Listening);
                 }
             }
+            // Corrected where the engine's text comes in: the partial, the final and the paste
+            // all hold the same words.
             EngineEvent::Partial { utterance, text } => {
                 let utterance = self.utterance(utterance);
+                let text = self.vocabulary.correct(&text);
                 if let Some(text) = self.partial.read(&text) {
                     self.bus.publish(&Event::Partial { utterance, text });
                 }
             }
             EngineEvent::Final { utterance, text } => {
                 let utterance = self.utterance(utterance);
+                let text = self.vocabulary.correct(&text);
                 self.open_utterance = None;
+                if self.last.len() == LAST_PHRASES {
+                    self.last.pop_front();
+                }
+                self.last.push_back(text.clone());
                 if self.pasting {
                     self.dictated.push(text.clone());
                 }
@@ -492,6 +543,16 @@ fn client(stream: UnixStream, daemon: Handle) {
         return;
     }
     let word = line.trim();
+    if word == "last" {
+        let answer = Answer {
+            state: None,
+            error: None,
+            phrases: Some(daemon.last()),
+        };
+        let answer = serde_json::to_string(&answer).expect("an answer serialises");
+        let _ = (&stream).write_all(format!("{answer}\n").as_bytes());
+        return;
+    }
     if word == "watch" {
         if stream.set_write_timeout(Some(WATCHER_TIMEOUT)).is_ok() {
             daemon.watch(Box::new(stream));

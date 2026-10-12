@@ -72,7 +72,14 @@ fn run_daemon(dirs: &Dirs, audio_file: Option<&Path>) -> Result<(), String> {
     });
     daemon::serve(
         listener,
-        daemon::spawn(mic, engine, paste, hold, Arc::new(Instant::now)),
+        daemon::spawn(
+            mic,
+            engine,
+            paste,
+            hold,
+            Arc::new(Instant::now),
+            dirs.vocabulary_file(),
+        ),
     );
     Ok(())
 }
