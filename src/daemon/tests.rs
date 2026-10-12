@@ -134,6 +134,54 @@ impl EngineInput for FakeInput {
     }
 }
 
+/// An engine that takes its time to load, like crispasr: it takes audio at once (the pipe holds
+/// it), says `Ready` once loaded, and its final tells how many samples it received in all.
+struct SlowEngine {
+    load: Duration,
+    /// The samples received when `Ready` was said.
+    before_ready: Arc<AtomicUsize>,
+}
+
+struct SlowInput {
+    loaded: thread::JoinHandle<()>,
+    received: Arc<AtomicUsize>,
+    sink: Arc<Sink>,
+}
+
+impl Engine for SlowEngine {
+    fn open(&self, sink: Sink) -> io::Result<Box<dyn EngineInput>> {
+        let sink = Arc::new(sink);
+        let received = Arc::new(AtomicUsize::new(0));
+        let (load, before_ready) = (self.load, Arc::clone(&self.before_ready));
+        let (said, count) = (Arc::clone(&sink), Arc::clone(&received));
+        let loaded = thread::spawn(move || {
+            thread::sleep(load);
+            before_ready.store(count.load(Ordering::SeqCst), Ordering::SeqCst);
+            said(EngineEvent::Ready);
+        });
+        Ok(Box::new(SlowInput {
+            loaded,
+            received,
+            sink,
+        }))
+    }
+}
+
+impl EngineInput for SlowInput {
+    fn write(&mut self, pcm: &[i16]) -> io::Result<()> {
+        self.received.fetch_add(pcm.len(), Ordering::SeqCst);
+        Ok(())
+    }
+
+    // Like crispasr, the audio given while loading is transcribed once the model is there.
+    fn finish(self: Box<Self>) {
+        self.loaded.join().unwrap();
+        let received = self.received.load(Ordering::SeqCst);
+        (self.sink)(final_(1, &format!("{received} samples")));
+        (self.sink)(EngineEvent::Ended(Ok(())));
+    }
+}
+
 fn partial(utterance: u64, text: &str) -> EngineEvent {
     EngineEvent::Partial {
         utterance,
@@ -613,6 +661,71 @@ fn when_the_audio_ends_the_dictation_stops_by_itself() {
         ev_final(1, "Fin."),
         state(State::Idle),
     ]);
+}
+
+fn slow_daemon(load: Duration, mic: FakeMic) -> (Handle, Arc<AtomicUsize>, FakePaste) {
+    let before_ready = Arc::new(AtomicUsize::new(0));
+    let engine = SlowEngine {
+        load,
+        before_ready: Arc::clone(&before_ready),
+    };
+    let paste = FakePaste::default();
+    let handle = spawn(
+        Arc::new(mic),
+        Arc::new(engine),
+        Some(Box::new(paste.clone())),
+        HOLD,
+        Arc::new(Instant::now),
+    );
+    (handle, before_ready, paste)
+}
+
+// The model takes a moment to load, the microphone does not wait for it: the words spoken in
+// that moment are in the transcript, not dropped.
+#[test]
+fn words_spoken_while_the_model_loads_reach_the_transcript() {
+    // 3 s of speech, handed over in 150 ms: all of it comes before the model is ready.
+    let mic = FakeMic {
+        chunks: Some(30),
+        ..FakeMic::default()
+    };
+    let (daemon, before_ready, paste) = slow_daemon(Duration::from_millis(300), mic);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&state(State::Loading));
+    watcher.expect(&[
+        state(State::Stopping),
+        ev_final(1, "48000 samples"),
+        state(State::Idle),
+    ]);
+    assert_eq!(before_ready.load(Ordering::SeqCst), 48_000);
+    assert_eq!(
+        *paste.0.lock().unwrap(),
+        [Handed::Begin, Handed::Phrase("48000 samples".into())]
+    );
+}
+
+#[test]
+fn speech_goes_on_after_the_model_is_ready_and_nothing_before_it_is_lost() {
+    // 10 s of speech over 500 ms: the model is ready, 200 ms in, with speech on both sides.
+    let mic = FakeMic {
+        chunks: Some(100),
+        ..FakeMic::default()
+    };
+    let (daemon, before_ready, _) = slow_daemon(Duration::from_millis(200), mic);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&state(State::Loading));
+    watcher.expect(&[
+        state(State::Listening),
+        state(State::Stopping),
+        ev_final(1, "160000 samples"),
+    ]);
+    // A loaded machine reads fewer than the 40 chunks 200 ms is worth, never none.
+    assert!(
+        before_ready.load(Ordering::SeqCst) >= 1_600,
+        "nothing came before Ready"
+    );
 }
 
 #[test]
