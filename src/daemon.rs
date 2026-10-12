@@ -383,8 +383,10 @@ impl Core {
             }
             EngineEvent::Silence => self.bus.publish(&Event::Silence),
             // The last final is in; the engine is only unloading its model now, which the
-            // paste does not wait for. The state stays `Stopping` until `Ended`.
-            EngineEvent::Flushed => self.paste_dictation(),
+            // paste does not wait for. The state stays `Stopping` until `Ended`. A flush while
+            // the dictation goes on is not one: pasting then would cut it in two.
+            EngineEvent::Flushed if self.state == State::Stopping => self.paste_dictation(),
+            EngineEvent::Flushed => {}
             EngineEvent::Ended(result) => {
                 if let Err(message) = result {
                     self.bus.publish(&Event::Error { message });

@@ -151,7 +151,7 @@ fn parse_line(line: &str) -> Option<EngineEvent> {
     // empty line, and only then unloads the model. Nothing else prints an empty line in a
     // stream, and it comes after every final, so it tells that the last one is in. If it were
     // held back until the exit, the paste would just wait for `Ended`, as it did.
-    if line.is_empty() {
+    if line.trim().is_empty() {
         return Some(EngineEvent::Flushed);
     }
     let line: Line = serde_json::from_str(line).ok()?;
@@ -206,6 +206,7 @@ mod tests {
     #[test]
     fn the_empty_line_after_the_last_final_is_the_flush() {
         assert_eq!(parse_line(""), Some(EngineEvent::Flushed));
+        assert_eq!(parse_line("  \t"), Some(EngineEvent::Flushed));
     }
 
     #[test]

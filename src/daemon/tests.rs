@@ -1199,6 +1199,32 @@ fn an_engine_that_never_says_it_flushed_is_pasted_when_it_ends() {
 }
 
 #[test]
+fn an_empty_engine_line_while_listening_pastes_nothing() {
+    let engine = FakeEngine {
+        script: vec![
+            (0, EngineEvent::Ready),
+            (1_600, final_(1, "Bonjour.")),
+            (3_200, EngineEvent::Flushed),
+            (4_800, partial(2, "Ça")),
+        ],
+        on_finish: vec![final_(2, "Ça va ?")],
+        ..FakeEngine::default()
+    };
+    let (daemon, paste) = pasting_daemon(engine);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&ev_partial(2, "Ça"));
+    assert_eq!(*paste.0.lock().unwrap(), [Handed::Begin]);
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    // One paste, with both phrases: the stray flush did not cut the dictation in two.
+    assert_eq!(
+        *paste.0.lock().unwrap(),
+        [Handed::Begin, Handed::Phrase("Bonjour. Ça va ?".into())]
+    );
+}
+
+#[test]
 fn a_dictation_with_no_final_pastes_nothing() {
     let (daemon, paste) = pasting_daemon(ready_engine());
     let watcher = Watcher::on(&daemon);
