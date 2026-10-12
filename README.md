@@ -1,6 +1,6 @@
 # Vocaline
 
-Local dictation for Linux: the phrase shows while you speak, and is pasted at the pause.
+Local dictation for Linux: the phrase shows while you speak, and the dictation is pasted once, when it stops.
 Parakeet through CrispASR, on the GPU when there is one. Nothing leaves the machine.
 
 Work in progress: see the issues. Agents read `AGENTS.md`.
@@ -95,14 +95,20 @@ listening, and the next press stops it. Either way, the phrase being spoken is f
 
 ## Pasting
 
-Each final phrase is pasted in the window that had the focus when the dictation started, even if
-the focus moved since: the focus is given back to it first (if it was closed, the phrase goes
-where the focus is). Phrases are separated by a space, the first of a dictation has none.
+Nothing is written while you speak: the phrases are cut at each pause and decoded right away,
+but only the event stream has them (a desktop shell can show them as a live preview). When the
+dictation stops (key released, second tap, `stop`), its phrases are joined by a space, in
+order, and pasted once, as soon as the last open phrase is decoded. A dictation with no phrase
+pastes nothing.
+
+The text is pasted in the window that had the focus when the dictation started, even if the
+focus moved since: the focus is given back to it first (if it was closed, the text goes where
+the focus is).
 
 The phrase goes through the clipboard and a paste shortcut typed by `wtype`: Ctrl+Shift+V in a
 terminal (foot, Alacritty, kitty, Ghostty, WezTerm…), Ctrl+V elsewhere. The clipboard is put
-back as it was, with every type it held (a screenshot stays a screenshot), 400 ms after the last
-phrase: the application reads the clipboard on its own time after the shortcut. The phrase is
+back as it was, with every type it held (a screenshot stays a screenshot), 400 ms after the
+paste: the application reads the clipboard on its own time after the shortcut. The text is
 offered with the `x-kde-passwordManagerHint` type, so a clipboard history that honours it keeps
 no copy of what was dictated.
 
