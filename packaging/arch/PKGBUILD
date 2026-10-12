@@ -1,0 +1,93 @@
+# Builds the checkout this file sits in, not a download of it: CI and a local `makepkg` package
+# exactly the commit they stand on.
+
+pkgname=vocaline
+pkgver=0.0.0
+pkgrel=1
+pkgdesc='Local dictation: the phrase shows while you speak, and is pasted when you stop'
+arch=(x86_64)
+url='https://github.com/KristenJestin/vocaline'
+# Vocaline is Apache-2.0; the CrispASR it bundles is MIT, and its OpenBLAS BSD-3-Clause.
+license=(Apache-2.0 MIT BSD-3-Clause)
+depends=(
+  gcc-libs glibc
+  # The GCC runtime CrispASR links: the system's copy instead of the one in its archive.
+  libgomp libgfortran libquadmath
+  curl      # vocaline setup
+  pipewire  # pw-record
+  wtype     # the paste shortcut
+)
+optdepends=(
+  'cuda: the cuda backend, on an NVIDIA GPU'
+  'hyprland: pasting where the dictation started'
+)
+makedepends=(cargo git)
+# The engine is a prebuilt release: stripping it gains nothing and risks breaking it.
+options=(!strip !debug)
+
+_crispasr=0.8.42
+_bundle=crispasr-linux-x86_64-cuda13
+source=("crispasr-$_crispasr-cuda13.tar.gz::https://github.com/CrispStrobe/CrispASR/releases/download/v$_crispasr/$_bundle.tar.gz")
+sha256sums=('8bfb828151fd3c9c15e49bbd5a7946ccb1c332be68eb9b3b029fcc4e3e4ce4d2')
+
+_root=$(realpath "$startdir/../..")
+
+# On a tag vX.Y.Z: X.Y.Z, which must be the version of Cargo.toml. Elsewhere, the usual scheme
+# of a VCS package, X.Y.Z.rN.gHASH: N commits after the last release tag (0.0.0 before the
+# first), so pacman orders a dev build after the release it follows and before the next one.
+pkgver() {
+  cd "$_root"
+  local described tag count
+  if described=$(git describe --long --tags --abbrev=7 --match 'v[0-9]*' 2>/dev/null); then
+    tag=${described%-*-g*}
+    count=${described#"$tag"-}
+    count=${count%%-*}
+  else
+    tag=v0.0.0
+    count=$(git rev-list --count HEAD)
+  fi
+  if [[ $count == 0 && $tag != v0.0.0 ]]; then
+    local cargo
+    cargo=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+    if [[ ${tag#v} != "$cargo" ]]; then
+      error "tag %s does not match the version of Cargo.toml (%s)" "$tag" "$cargo"
+      return 1
+    fi
+    printf '%s' "${tag#v}"
+  else
+    printf '%s.r%s.g%s' "${tag#v}" "$count" "$(git rev-parse --short=7 HEAD)"
+  fi
+}
+
+prepare() {
+  cargo fetch --locked --manifest-path "$_root/Cargo.toml" --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+  export CARGO_TARGET_DIR="$srcdir/target"
+  export VOCALINE_ENGINE=/usr/lib/vocaline/crispasr/crispasr
+  export VOCALINE_VERSION=$pkgver
+  cargo build --release --frozen --manifest-path "$_root/Cargo.toml"
+}
+
+check() {
+  export CARGO_TARGET_DIR="$srcdir/target"
+  export VOCALINE_ENGINE=/usr/lib/vocaline/crispasr/crispasr
+  export VOCALINE_VERSION=$pkgver
+  cargo test --release --frozen --manifest-path "$_root/Cargo.toml"
+}
+
+package() {
+  install -Dm755 "$srcdir/target/release/vocaline" "$pkgdir/usr/bin/vocaline"
+  install -Dm644 "$_root/packaging/vocaline.service" "$pkgdir/usr/lib/systemd/user/vocaline.service"
+  install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" "$_root/LICENSE" "$_root/NOTICE"
+  install -Dm644 -t "$pkgdir/usr/share/doc/vocaline" "$_root/README.md" "$_root/docs/events.md"
+
+  # The engine keeps its archive's layout: crispasr finds its libraries beside itself.
+  local engine="$pkgdir/usr/lib/vocaline/crispasr"
+  install -d "$engine"
+  cp -a "$srcdir/$_bundle/." "$engine/"
+  rm "$engine"/{libgomp.so.1,libgfortran.so.5,libquadmath.so.0}
+  install -d "$pkgdir/usr/share/licenses/$pkgname/crispasr"
+  mv "$engine"/{LICENSE,THIRD_PARTY_NOTICES.txt} "$pkgdir/usr/share/licenses/$pkgname/crispasr/"
+}
