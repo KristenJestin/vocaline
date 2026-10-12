@@ -78,6 +78,18 @@ impl Vocabulary {
         self
     }
 
+    /// Whether the vocabulary writes `word` with a capital, as a word of a wanted text
+    /// (`Foobar`, or `Bar` in `Foo-Bar`): a capital the dictation must keep.
+    pub fn capitalises(&self, word: &str) -> bool {
+        word.chars().next().is_some_and(char::is_uppercase)
+            && self.entries.iter().any(|entry| {
+                entry
+                    .wanted
+                    .split(|c: char| !c.is_alphanumeric())
+                    .any(|wanted| wanted == word)
+            })
+    }
+
     /// The text with every heard entry replaced by the way it must be written.
     pub fn correct(&self, text: &str) -> String {
         if self.entries.is_empty() {

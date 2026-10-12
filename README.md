@@ -119,9 +119,19 @@ voice assistant) can read `vocaline watch`.
 
 Nothing is written while you speak: the phrases are cut at each pause and decoded right away,
 but only the event stream has them (a desktop shell can show them as a live preview). When the
-dictation stops (key released, second tap, `stop`), its phrases are joined by a space, in
-order, and pasted once, as soon as the last open phrase is decoded. A dictation with no phrase
-pastes nothing.
+dictation stops (key released, second tap, `stop`), its phrases are joined, in order, and pasted
+once, as soon as the last open phrase is decoded. A dictation with no phrase pastes nothing.
+
+The pause that cuts a phrase does not always end a sentence: the model punctuates each phrase
+alone. When a phrase ends with an ellipsis (`...` or `…`) or with no closing mark (`.`, `!`,
+`?`), the next one goes on from it: in the pasted text the ellipsis goes and the next phrase
+starts lowercase (`Je voulais dire... Que ça marche.` is pasted as `Je voulais dire que ça
+marche.`). A phrase that ended (`.`, `!`, `?`) is followed by a space and keeps its capital. A
+capital that is not the start of a sentence stays: `I`, a word in capitals (`NASA`), a word with
+a capital inside, a word your vocabulary writes with one. The ellipsis that ends the whole text
+stays. Only the pasted text is joined: `vocaline last` and the event stream keep one phrase each,
+as shown. With a rule's `drop_period`, the join comes first, then the period that ends the whole
+text goes.
 
 The text is pasted in the window that had the focus when the dictation started, even if the
 focus moved since: the focus is given back to it first (if it was closed, the text goes where

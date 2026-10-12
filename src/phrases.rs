@@ -1,7 +1,7 @@
 //! Text steps applied to what the engine heard, without any model: the filler words are dropped
-//! from each phrase.
+//! from each phrase, and the phrases a pause cut in two are joined back in the pasted text.
 
-use crate::vocabulary::{fold, matched};
+use crate::vocabulary::{Vocabulary, fold, matched};
 
 /// The hesitations the engine writes, in French and in English. Words that carry meaning
 /// (`bah`, `ben`, `bon`, `oui`, `yeah`) are not here: whoever wants them gone says so in the
@@ -117,6 +117,70 @@ fn ends_in_ellipsis(text: &[char]) -> bool {
     text.ends_with(&['.', '.']) || text.ends_with(&['…'])
 }
 
+/// The phrases of a dictation as one text. They are joined by a space, except where the pause cut
+/// a sentence: a phrase that ends with an ellipsis (`...` or `…`) or with no closing mark
+/// (`.`, `!`, `?`) goes on in the next one, the ellipsis goes and the next phrase starts
+/// lowercase. The ellipsis of the last phrase is kept: nothing follows it.
+///
+/// A capital stays where the lowercase would be wrong: `I`, a word in capitals or with a capital
+/// inside (`NASA`, `McDonald`), a word the vocabulary writes with one.
+pub fn join(phrases: &[String], vocabulary: &Vocabulary) -> String {
+    let mut text = String::new();
+    for phrase in phrases.iter().map(|phrase| phrase.trim()) {
+        if phrase.is_empty() {
+            continue;
+        }
+        if text.is_empty() {
+            text.push_str(phrase);
+        } else if let Some(open) = cut(&text) {
+            text = open;
+            text.push(' ');
+            text.push_str(&lowered(phrase, vocabulary));
+        } else {
+            text.push(' ');
+            text.push_str(phrase);
+        }
+    }
+    text
+}
+
+/// What closes a phrase and may follow its last mark: `"Bonjour."`, `(Bonjour.)`, `« Bonjour. »`.
+const CLOSERS: [char; 7] = ['"', '\'', '»', '”', ')', ']', '’'];
+
+/// The phrase without its ellipsis when a pause cut it, none when it ended.
+fn cut(phrase: &str) -> Option<String> {
+    let body = phrase.trim_end_matches(|c: char| c.is_whitespace() || CLOSERS.contains(&c));
+    let closers = &phrase[body.len()..];
+    if body.ends_with("...") || body.ends_with('…') {
+        let open = body.trim_end_matches(['.', '…']).trim_end();
+        return Some(format!("{open}{}", closers.trim_end()));
+    }
+    (!body.ends_with(['.', '!', '?'])).then(|| phrase.to_string())
+}
+
+/// The phrase with its first letter lowercase, unless that is a capital to keep.
+fn lowered(phrase: &str, vocabulary: &Vocabulary) -> String {
+    let Some((start, first)) = phrase.char_indices().find(|(_, c)| c.is_alphanumeric()) else {
+        return phrase.to_string();
+    };
+    let word: String = phrase[start..]
+        .chars()
+        .take_while(|c| c.is_alphanumeric())
+        .collect();
+    let keep = !first.is_uppercase()
+        || word == "I"
+        || word.chars().skip(1).any(char::is_uppercase)
+        || vocabulary.capitalises(&word);
+    if keep {
+        return phrase.to_string();
+    }
+    let mut out = String::with_capacity(phrase.len());
+    out.push_str(&phrase[..start]);
+    out.extend(first.to_lowercase());
+    out.push_str(&phrase[start + first.len_utf8()..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +255,107 @@ mod tests {
     fn a_phrase_without_filler_is_left_untouched() {
         let text = "  Bonjour  tout le monde.  ";
         assert_eq!(Fillers::default().drop(text), text);
+    }
+
+    fn joined(phrases: &[&str]) -> String {
+        join_with(phrases, "")
+    }
+
+    fn join_with(phrases: &[&str], vocabulary: &str) -> String {
+        let (vocabulary, problems) = Vocabulary::parse(vocabulary);
+        assert!(problems.is_empty(), "{problems:?}");
+        let phrases: Vec<String> = phrases.iter().map(|phrase| phrase.to_string()).collect();
+        join(&phrases, &vocabulary)
+    }
+
+    #[test]
+    fn a_phrase_cut_by_a_pause_is_joined_lowercase() {
+        assert_eq!(
+            joined(&["Je voulais dire...", "Que ça marche."]),
+            "Je voulais dire que ça marche."
+        );
+        assert_eq!(
+            joined(&["Je voulais dire…", "Que ça marche."]),
+            "Je voulais dire que ça marche."
+        );
+        // No closing mark at all, or only a comma: the sentence is not over.
+        assert_eq!(
+            joined(&["on peut tester ce qui", "Marche bien."]),
+            "on peut tester ce qui marche bien."
+        );
+        assert_eq!(joined(&["Alors,", "On y va."]), "Alors, on y va.");
+        assert_eq!(
+            joined(&["Il a dit...", "Euh non.", "Rien."]),
+            "Il a dit euh non. Rien."
+        );
+        assert_eq!(
+            joined(&["Je voulais...", "Dire que...", "Ça marche."]),
+            "Je voulais dire que ça marche."
+        );
+        assert_eq!(joined(&["J'ai dit...", "À demain."]), "J'ai dit à demain.");
+    }
+
+    #[test]
+    fn a_phrase_that_ended_is_not_joined() {
+        assert_eq!(joined(&["Bonjour.", "Ça va ?"]), "Bonjour. Ça va ?");
+        assert_eq!(
+            joined(&["Ça va ?", "Oui !", "Super."]),
+            "Ça va ? Oui ! Super."
+        );
+        assert_eq!(
+            joined(&["Il dit « bonjour. »", "Puis il part."]),
+            "Il dit « bonjour. » Puis il part."
+        );
+        assert_eq!(joined(&["(Bonjour.)", "Ça va."]), "(Bonjour.) Ça va.");
+    }
+
+    #[test]
+    fn the_ellipsis_of_the_last_phrase_is_kept_and_a_single_phrase_is_untouched() {
+        assert_eq!(
+            joined(&["Bonjour.", "Je me demande..."]),
+            "Bonjour. Je me demande..."
+        );
+        assert_eq!(joined(&["Je me demande"]), "Je me demande");
+        assert_eq!(joined(&[]), "");
+        assert_eq!(joined(&["Bonjour.", "", "  ", "Ça va."]), "Bonjour. Ça va.");
+        assert_eq!(
+            joined(&["  Je pense... ", " Que oui. "]),
+            "Je pense que oui."
+        );
+    }
+
+    #[test]
+    fn a_vocabulary_capital_survives_the_join() {
+        let vocabulary = "foo bar -> Foobar\nzoe -> Zoé";
+        assert_eq!(
+            join_with(&["J'ouvre...", "Foobar avec Zoé."], vocabulary),
+            "J'ouvre Foobar avec Zoé."
+        );
+        assert_eq!(
+            join_with(&["On appelle...", "Zoé demain."], vocabulary),
+            "On appelle Zoé demain."
+        );
+        // Without the entry, the capital is only the start of a sentence.
+        assert_eq!(
+            join_with(&["J'ouvre...", "Foobar marche."], ""),
+            "J'ouvre foobar marche."
+        );
+    }
+
+    #[test]
+    fn a_word_in_capitals_or_i_keeps_its_capital_in_a_join() {
+        assert_eq!(
+            joined(&["Ils travaillent à...", "NASA tous les jours."]),
+            "Ils travaillent à NASA tous les jours."
+        );
+        assert_eq!(
+            joined(&["Il a vu...", "McDonald hier."]),
+            "Il a vu McDonald hier."
+        );
+        assert_eq!(
+            joined(&["And then...", "I think so."]),
+            "And then I think so."
+        );
+        assert_eq!(joined(&["And then...", "I'm sure."]), "And then I'm sure.");
     }
 }

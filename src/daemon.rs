@@ -9,7 +9,7 @@ use crate::audio::{Capture, Microphone, SAMPLE_RATE, rms};
 use crate::engine::{Engine, EngineEvent, EngineInput};
 use crate::events::{Event, State, VERSION};
 use crate::output::Paste;
-use crate::phrases::Fillers;
+use crate::phrases::{self, Fillers};
 use crate::rules::{self, Rule};
 use crate::stats::{self, Dictation, Ledger};
 use crate::steady::Steady;
@@ -525,13 +525,9 @@ impl Core {
     /// comes second pastes nothing: the paste happens once.
     fn paste_dictation(&mut self) {
         let finals = std::mem::take(&mut self.dictated);
-        let text = finals
-            .iter()
-            .map(|text| text.trim())
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        // The rule shapes the one text that is pasted; the finals of the stream are left as heard.
+        // The join comes before the rule: `drop_period` then acts on the end of the whole text.
+        // The finals of the stream and of `last` are left as shown.
+        let text = phrases::join(&finals, &self.vocabulary);
         let text = match &self.rule {
             Some(rule) => rule.finish(&text),
             None => text,

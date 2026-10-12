@@ -2447,3 +2447,108 @@ fn fillers_are_not_counted_as_words() {
     dictate_to_the_end(&daemon, Command::StartNoPaste);
     assert_eq!(ledger.kept()[0].words, 4);
 }
+
+/// An engine that hears each of `finals` as a phrase of its own, one utterance each.
+fn hearing(finals: &[&str]) -> FakeEngine {
+    let phrases = finals
+        .iter()
+        .enumerate()
+        .map(|(n, text)| ((n + 1) * 1_600, final_(n as u64 + 1, text)));
+    FakeEngine {
+        script: [vec![(0, EngineEvent::Ready)], phrases.collect()].concat(),
+        ..FakeEngine::default()
+    }
+}
+
+#[test]
+fn a_phrase_cut_by_a_pause_is_pasted_joined_and_the_stream_keeps_one_final_per_phrase() {
+    let (daemon, paste) = filler_daemon(
+        hearing(&["Je voulais dire...", "Que ça marche."]),
+        Fillers::default(),
+        no_vocabulary(),
+    );
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&ev_final(1, "Je voulais dire..."));
+    watcher.skip_to(&ev_final(2, "Que ça marche."));
+    // `last` shows the phrases as shown: the join is only for the paste.
+    assert_eq!(daemon.last(), ["Je voulais dire...", "Que ça marche."]);
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        handed(&paste),
+        [
+            Handed::Begin,
+            Handed::Phrase("Je voulais dire que ça marche.".into())
+        ]
+    );
+}
+
+#[test]
+fn a_vocabulary_capital_survives_the_join_in_a_dictation() {
+    let file = vocabulary_file("join");
+    crate::vocabulary::teach(&file, "foo bar", "Foobar").unwrap();
+    let (daemon, paste) = filler_daemon(
+        hearing(&["J'ouvre...", "Foo bar avec Alice."]),
+        Fillers::default(),
+        file,
+    );
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&ev_final(2, "Foobar avec Alice."));
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        handed(&paste),
+        [
+            Handed::Begin,
+            Handed::Phrase("J'ouvre Foobar avec Alice.".into())
+        ]
+    );
+}
+
+#[test]
+fn a_filler_that_ended_a_phrase_leaves_it_open_for_the_join() {
+    let (daemon, paste) = filler_daemon(
+        hearing(&["On peut tester euh...", "Ça marche."]),
+        Fillers::default(),
+        no_vocabulary(),
+    );
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&ev_final(1, "On peut tester"));
+    watcher.skip_to(&ev_final(2, "Ça marche."));
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        handed(&paste),
+        [
+            Handed::Begin,
+            Handed::Phrase("On peut tester ça marche.".into())
+        ]
+    );
+}
+
+#[test]
+fn a_rule_drops_the_period_of_the_text_once_joined() {
+    let paste = FakePaste::in_window("foot");
+    let daemon = ruled_daemon(
+        hearing(&["Je lance...", "Ls -la."]),
+        &paste,
+        vec![terminal()],
+        no_vocabulary(),
+    );
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&ev_final(2, "Ls -la."));
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    assert_eq!(
+        handed(&paste),
+        [
+            Handed::Begin,
+            Handed::Phrase("Je lance ls -la".into()),
+            Handed::Enter
+        ]
+    );
+}
