@@ -5,6 +5,7 @@ mod daemon;
 mod engine;
 mod events;
 mod output;
+mod setup;
 mod steady;
 
 use audio::{Microphone, PwRecord, WavFile};
@@ -44,6 +45,15 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("{}", cli::request(&dirs.socket(), command.word())?.name());
         }
         Cli::Watch => cli::watch(&dirs.socket(), &mut std::io::stdout().lock())?,
+        Cli::Setup => {
+            let config = Config::load(&dirs)?;
+            setup::setup(
+                &setup::wanted(&config.engine),
+                setup::CATALOGUE,
+                &setup::Curl,
+                &mut std::io::stdout().lock(),
+            )?;
+        }
     }
     Ok(())
 }

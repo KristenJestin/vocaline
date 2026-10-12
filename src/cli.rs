@@ -18,13 +18,16 @@ usage: vocaline <command>
   stop                         stop listening; the open phrase is finalised
   toggle                       start, or stop
   status                       print the state: idle, loading, listening or stopping
-  watch                        print the event stream, one JSON object per line";
+  watch                        print the event stream, one JSON object per line
+  setup                        download the model and the VAD model the configuration names,
+                               if they are missing; their size is shown first";
 
 #[derive(Debug, PartialEq)]
 pub enum Cli {
     Daemon { audio_file: Option<PathBuf> },
     Command(Command),
     Watch,
+    Setup,
     Help,
 }
 
@@ -38,6 +41,7 @@ impl Cli {
             }),
             ["start", "--no-paste"] => Ok(Cli::Command(Command::StartNoPaste)),
             ["watch"] => Ok(Cli::Watch),
+            ["setup"] => Ok(Cli::Setup),
             ["help" | "--help" | "-h"] => Ok(Cli::Help),
             [word] => Command::parse(word)
                 .map(Cli::Command)
@@ -140,6 +144,7 @@ mod tests {
             Ok(Cli::Command(Command::StartNoPaste))
         );
         assert_eq!(Cli::parse(&args(&["watch"])), Ok(Cli::Watch));
+        assert_eq!(Cli::parse(&args(&["setup"])), Ok(Cli::Setup));
         assert_eq!(Cli::parse(&args(&["--help"])), Ok(Cli::Help));
     }
 
