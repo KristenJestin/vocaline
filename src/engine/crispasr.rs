@@ -331,10 +331,25 @@ mod tests {
             ..EngineConfig::default()
         };
         let (tx, rx) = mpsc::channel();
-        let tx = Mutex::new(tx);
-        let mut input = CrispAsr::new(config)
-            .open(Box::new(move |e| tx.lock().unwrap().send(e).unwrap()))
-            .unwrap();
+        // Another test thread may fork while the script is still open for writing: the child
+        // holds that descriptor until its own exec, and the kernel refuses to run a file
+        // someone has open for writing (ETXTBSY). That ends as soon as the child has exec'd, so
+        // the open is tried again; it succeeds the first time on a machine that is not busy.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut input = loop {
+            let tx = Mutex::new(tx.clone());
+            match CrispAsr::new(config.clone())
+                .open(Box::new(move |e| tx.lock().unwrap().send(e).unwrap()))
+            {
+                Err(e)
+                    if e.kind() == io::ErrorKind::ExecutableFileBusy
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                result => break result.unwrap(),
+            }
+        };
         input.write(audio).unwrap();
         input.finish();
         let mut events = Vec::new();
