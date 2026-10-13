@@ -17,7 +17,7 @@ jobs:
     container: archlinux:base-devel
     steps:
       # git first: without it the checkout has no history, and the version counts commits.
-      - run: pacman -Syu --noconfirm --needed git namcap
+      - run: pacman -Syu --noconfirm --needed git namcap ccache
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -25,12 +25,38 @@ jobs:
         working-directory: packaging/arch
         run: |
           pacman -S --noconfirm --needed $(source ./PKGBUILD && echo "${depends[@]}" "${makedepends[@]}")
+      # Compiling CrispASR's CUDA kernels is most of the build: ggml uses ccache when it is
+      # there, so its cache is kept from one run to the next. The key names the CrispASR
+      # version, the patch and the build() of the PKGBUILD; a run that changes one of them
+      # starts from the closest cache and only compiles again what changed.
+      - name: Name the compiler cache
+        id: ccache-key
+        working-directory: packaging/arch
+        run: |
+          version=$(source ./PKGBUILD && echo "$_crispasr")
+          inputs=$(cat crispasr-short-context.patch <(sed -n '/^build() {/,/^}/p' PKGBUILD) | sha256sum | cut -c1-16)
+          echo "prefix=crispasr-$version-" >> "$GITHUB_OUTPUT"
+          echo "key=crispasr-$version-$inputs" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        with:
+          path: /ccache
+          key: ${{ steps.ccache-key.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ steps.ccache-key.outputs.key }}-
+            ${{ steps.ccache-key.outputs.prefix }}
       # makepkg refuses to run as root.
       - name: Build the package
         run: |
           useradd --create-home builder
-          chown -R builder "$GITHUB_WORKSPACE"
-          su builder -c "git config --global --add safe.directory '$GITHUB_WORKSPACE' && cd '$GITHUB_WORKSPACE/packaging/arch' && makepkg --noconfirm"
+          mkdir -p /ccache
+          chown -R builder "$GITHUB_WORKSPACE" /ccache
+          su builder -c "export CCACHE_DIR=/ccache CCACHE_MAXSIZE=3G && ccache -z && git config --global --add safe.directory '$GITHUB_WORKSPACE' && cd '$GITHUB_WORKSPACE/packaging/arch' && makepkg --noconfirm; status=\$?; ccache -s; exit \$status"
+      # Saved even when the build fails, so the next attempt does not compile it all again.
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: /ccache
+          key: ${{ steps.ccache-key.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Check the package
         working-directory: packaging/arch
         run: |
