@@ -4,7 +4,7 @@
 //! One process per dictation: the model is loaded when listening starts and unloaded when the
 //! process ends, after the end of the audio has finalised the open phrase.
 
-use super::{Engine, EngineEvent, EngineInput, Sink};
+use super::{Engine, EngineEvent, EngineInput, Failure, Sink};
 use crate::config::{Backend, EngineConfig};
 use serde::Deserialize;
 use std::collections::VecDeque;
@@ -28,6 +28,14 @@ pub struct CrispAsr {
 impl CrispAsr {
     pub fn new(config: EngineConfig) -> CrispAsr {
         CrispAsr { config }
+    }
+
+    /// The same configuration, on the CPU.
+    fn cpu_twin(&self) -> CrispAsr {
+        CrispAsr::new(EngineConfig {
+            backend: Backend::Cpu,
+            ..self.config.clone()
+        })
     }
 
     fn command(&self) -> Command {
@@ -108,8 +116,15 @@ impl Engine for CrispAsr {
 
         let diagnostics = Arc::new(Mutex::new(VecDeque::new()));
         let kept = Arc::clone(&diagnostics);
+        // Seen as it comes: the backtrace of the abort that follows pushes it out of the tail.
+        let gpu_full = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&gpu_full);
+        let on_gpu = self.config.backend != Backend::Cpu;
         let diagnostics_thread = thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if on_gpu && line.contains("out of memory") {
+                    seen.lock().unwrap().get_or_insert_with(|| tail(&line));
+                }
                 let mut kept = kept.lock().unwrap();
                 kept.push_back(line);
                 if kept.len() > KEPT_DIAGNOSTICS {
@@ -132,22 +147,30 @@ impl Engine for CrispAsr {
                 sink(event);
             }
             let _ = diagnostics_thread.join();
-            let result = match child.wait() {
+            let gpu_full = gpu_full.lock().unwrap().take();
+            let result = match (child.wait(), gpu_full) {
                 // A success while the audio was still coming is no end: the engine gave up.
-                Ok(status) if status.success() && ended_by_us.load(Ordering::SeqCst) => Ok(()),
-                Ok(status) if status.success() => Err(format!(
+                (Ok(status), _) if status.success() && ended_by_us.load(Ordering::SeqCst) => Ok(()),
+                (Ok(status), Some(line)) if !status.success() => Err(Failure::GpuMemory(line)),
+                (Ok(status), _) if status.success() => Err(Failure::Other(format!(
                     "the engine stopped by itself ({status}): {}",
                     tail(&diagnostics_text(&diagnostics))
-                )),
-                Ok(status) => Err(format!(
+                ))),
+                (Ok(status), _) => Err(Failure::Other(format!(
                     "the engine stopped ({status}): {}",
                     tail(&diagnostics_text(&diagnostics))
-                )),
-                Err(e) => Err(format!("the engine could not be awaited: {e}")),
+                ))),
+                (Err(e), _) => Err(Failure::Other(format!(
+                    "the engine could not be awaited: {e}"
+                ))),
             };
             sink(EngineEvent::Ended(result));
         });
         Ok(Box::new(Input { stdin, finished }))
+    }
+
+    fn on_cpu(&self) -> Option<Arc<dyn Engine>> {
+        (self.config.backend != Backend::Cpu).then(|| Arc::new(self.cpu_twin()) as Arc<dyn Engine>)
     }
 }
 
@@ -485,7 +508,7 @@ mod tests {
     fn an_engine_that_fails_ends_with_its_diagnostics() {
         let script = "cat >/dev/null; echo 'error: model not found' >&2; exit 3";
         let events = run("fails", script, &[0; 16]);
-        let [EngineEvent::Ended(Err(message))] = events.as_slice() else {
+        let [EngineEvent::Ended(Err(Failure::Other(message)))] = events.as_slice() else {
             panic!("{events:?}");
         };
         assert!(message.contains("model not found"), "{message}");
@@ -502,7 +525,7 @@ mod tests {
             exit 3
         "#;
         let events = run("long-tail", script, &[0; 16]);
-        let [EngineEvent::Ended(Err(message))] = events.as_slice() else {
+        let [EngineEvent::Ended(Err(Failure::Other(message)))] = events.as_slice() else {
             panic!("{events:?}");
         };
         assert!(message.ends_with("error: the end, é"), "{message}");
@@ -516,12 +539,56 @@ mod tests {
         let script = "echo 'warning: no VAD model, giving up' >&2";
         let (input, rx) = open_fake("leaves", script);
         let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let EngineEvent::Ended(Err(message)) = event else {
+        let EngineEvent::Ended(Err(Failure::Other(message))) = event else {
             panic!("{event:?}");
         };
         assert!(message.contains("by itself"), "{message}");
         assert!(message.contains("no VAD model"), "{message}");
         drop(input);
+    }
+
+    // What crispasr printed on the maintainer's machine, three times in twenty minutes, before
+    // its abort; ggml then prints a backtrace, which pushes the memory line out of the tail.
+    #[test]
+    fn a_gpu_out_of_memory_is_told_apart_from_other_failures() {
+        let script = r##"
+            cat >/dev/null
+            echo 'ggml_backend_cuda_buffer_type_alloc_buffer: allocating 232.73 MiB on device 0: cudaMalloc failed: out of memory' >&2
+            echo 'parakeet: failed to alloc encoder graph' >&2
+            echo 'crispasr[parakeet]: single-pass encode failed (likely VRAM OOM at 17s); falling back to streamed encoding — pass --chunk-seconds N for segmented output or --att-context L,R for bounded-memory single-pass' >&2
+            echo 'ggml/src/ggml-backend.cpp:2433: GGML_ASSERT(...) failed' >&2
+            for i in $(seq 1 12); do echo "#$i 0x0000 in ggml_abort ()" >&2; done
+            kill -ABRT $$
+        "##;
+        let events = run("gpu-full", script, &[0; 16]);
+        let [EngineEvent::Ended(Err(Failure::GpuMemory(reason)))] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert!(
+            reason.ends_with("allocating 232.73 MiB on device 0: cudaMalloc failed: out of memory"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn the_engine_on_the_cpu_is_the_same_engine_with_the_cpu_backend() {
+        let config = EngineConfig {
+            model: "/models/p.gguf".into(),
+            ..EngineConfig::default()
+        };
+        let gpu = CrispAsr::new(config);
+        assert!(gpu.on_cpu().is_some());
+        let cpu = gpu.cpu_twin();
+        assert!(cpu.on_cpu().is_none(), "the CPU is the last resort");
+        let args: Vec<String> = cpu
+            .command()
+            .get_args()
+            .map(|a| a.to_str().unwrap().to_string())
+            .collect();
+        assert!(
+            args.join(" ")
+                .contains("-m /models/p.gguf -l fr --gpu-backend cpu")
+        );
     }
 
     #[test]

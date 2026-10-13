@@ -35,6 +35,11 @@ pub enum Event {
     Error {
         message: String,
     },
+    /// The GPU had no memory left for the dictation, which is decoded again on the CPU; its
+    /// finals come again from its start.
+    Fallback {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +114,12 @@ mod tests {
                     message: "the engine stopped".into(),
                 },
                 r#"{"type":"error","message":"the engine stopped"}"#,
+            ),
+            (
+                Event::Fallback {
+                    reason: "cudaMalloc failed: out of memory".into(),
+                },
+                r#"{"type":"fallback","reason":"cudaMalloc failed: out of memory"}"#,
             ),
         ];
         for (event, line) in cases {
