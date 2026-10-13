@@ -23,13 +23,14 @@ jobs:
           else
             tools/commit-message.sh --range "$base..$head"
           fi
-      # A pull request is squashed: its title becomes the commit subject.
+      # A pull request is squashed: its title becomes the commit subject, with " (#<n>)" appended.
       - name: Check the title of the pull request
         if: github.event_name == 'pull_request'
         env:
           TITLE: ${{ github.event.pull_request.title }}
+          NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          printf '%s\n' "$TITLE" > "$RUNNER_TEMP/title"
+          printf '%s (#%s)\n' "$TITLE" "$NUMBER" > "$RUNNER_TEMP/title"
           tools/commit-message.sh "$RUNNER_TEMP/title"
 
   # No GPU and no microphone here: the suites run against fakes (see AGENTS.md, Testing).
