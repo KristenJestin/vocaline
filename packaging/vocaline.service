@@ -1,0 +1,13 @@
+[Unit]
+Description=Vocaline, local dictation
+Documentation=file:///usr/share/doc/vocaline/README.md
+# The daemon pastes into the desktop: it lives and dies with the graphical session.
+PartOf=graphical-session.target
+After=graphical-session.target pipewire.service
+
+[Service]
+ExecStart=/usr/bin/vocaline daemon
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
