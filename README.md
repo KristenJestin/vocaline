@@ -37,6 +37,20 @@ Parakeet TDT 0.6B v3 q8_0 (674 MB) and Silero VAD v6.2.0 (0.9 MB) by default. It
 `parakeet-tdt-0.6b-v3-q8_0.gguf`, `-q5_0`, `-q4_k` (for a smaller machine) and
 `canary-1b-v2-q8_0.gguf`; another file, put it in the models folder yourself.
 
+Without an NVIDIA GPU (`nvidia-smi -L` lists none), `vocaline setup` sets the engine up for the
+CPU. With no `config.toml` yet it writes this block, says so, and downloads the q4_k model:
+
+```toml
+[engine]
+model = "parakeet-tdt-0.6b-v3-q4_k.gguf"
+backend = "cpu"
+partial_ms = 1500
+```
+
+On the CPU it takes about half the CPU of the default and keeps up with a long phrase; the
+first grey text comes about a second later (1.7 s instead of 0.7 s). A `config.toml` that
+exists is never edited: if it does not set `backend`, setup prints the block for you to copy.
+
 The unit is bound to `graphical-session.target`, which Hyprland started through `uwsm`
 reaches. The daemon pastes through Wayland and asks Hyprland which window has the focus: the
 user manager must have `WAYLAND_DISPLAY` and `HYPRLAND_INSTANCE_SIGNATURE` in its environment
