@@ -273,7 +273,8 @@ vocaline stats --json    # the same, as one JSON object, for a program
 
 For each period: the dictations, the words (without the filler words), the minutes heard, the time from the stop to the
 paste (median and maximum), and the same by application (the class of the window the dictation
-started in) and, for the last 7 days, by day. A dictation that pastes nothing (`start --no-paste`,
+started in) and, for the last 7 days, by day, and how many dictations the GPU had no memory
+for, which were decoded on the CPU instead (the line shows only when there is one). A dictation that pastes nothing (`start --no-paste`,
 `paste = false`) does not ask for the window, so it is counted under `unknown`, like one whose
 window the desktop could not name. A dictation in which nothing was heard is not counted.
 
@@ -283,7 +284,8 @@ it works with no daemon running. Removing the package leaves it, like the config
 it to start over.
 
 **No dictated text is stored**: a line holds the day, the class of the window, a word count, the
-audio duration in milliseconds and the time to paste in milliseconds. Not a word of the text,
+audio duration in milliseconds, the time to paste in milliseconds and, for a dictation decoded
+on the CPU because the GPU was full, `"cpu_fallback":true`. Not a word of the text,
 not even a window title. If the file cannot be written, an `error` event says so and the
 dictation is pasted all the same.
 

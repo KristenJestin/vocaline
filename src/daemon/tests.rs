@@ -1,6 +1,6 @@
 use super::*;
 use crate::audio::Capture;
-use crate::engine::{EngineInput, Sink};
+use crate::engine::{EngineInput, Failure, Sink};
 use crate::phrases::Fillers;
 use crate::rules::Rule;
 use std::collections::VecDeque;
@@ -83,7 +83,11 @@ struct FakeEngine {
     fail: bool,
     /// Only the first dictation hears the script: the next ones are silent.
     first_only: bool,
+    /// The engine `on_cpu` gives.
+    cpu: Option<Arc<FakeEngine>>,
     opens: AtomicUsize,
+    /// The samples received, over all its streams.
+    heard: Arc<AtomicUsize>,
     sink: Mutex<Option<Arc<Sink>>>,
 }
 
@@ -93,6 +97,7 @@ struct FakeInput {
     hold_end: bool,
     exit_delay: Duration,
     received: usize,
+    heard: Arc<AtomicUsize>,
     sink: Arc<Sink>,
 }
 
@@ -110,7 +115,8 @@ impl Engine for FakeEngine {
         }
         let sink = Arc::new(sink);
         *self.sink.lock().unwrap() = Some(Arc::clone(&sink));
-        let silent = self.first_only && self.opens.fetch_add(1, Ordering::SeqCst) > 0;
+        let opened = self.opens.fetch_add(1, Ordering::SeqCst);
+        let silent = self.first_only && opened > 0;
         let mut input = FakeInput {
             script: if silent {
                 VecDeque::new()
@@ -125,16 +131,22 @@ impl Engine for FakeEngine {
             hold_end: self.hold_end,
             exit_delay: self.exit_delay,
             received: 0,
+            heard: Arc::clone(&self.heard),
             sink,
         };
         input.write(&[])?;
         Ok(Box::new(input))
+    }
+
+    fn on_cpu(&self) -> Option<Arc<dyn Engine>> {
+        self.cpu.clone().map(|cpu| cpu as Arc<dyn Engine>)
     }
 }
 
 impl EngineInput for FakeInput {
     fn write(&mut self, pcm: &[i16]) -> io::Result<()> {
         self.received += pcm.len();
+        self.heard.fetch_add(pcm.len(), Ordering::SeqCst);
         while self
             .script
             .front()
@@ -2705,4 +2717,219 @@ mod model_files {
         watcher.skip_to(&state(State::Idle));
         assert_eq!(daemon.command(Command::Status), Ok(State::Idle));
     }
+}
+
+/// The line crispasr printed when the GPU had no memory left for a dictation (#38).
+const GPU_FULL: &str = "allocating 232.73 MiB on device 0: cudaMalloc failed: out of memory";
+
+/// The CPU twin of `gpu_full`: it hears a dictation through, slowly but surely.
+fn on_the_cpu() -> Arc<FakeEngine> {
+    Arc::new(FakeEngine {
+        script: vec![(0, EngineEvent::Ready)],
+        on_finish: vec![final_(1, "Bonjour tout le monde."), EngineEvent::Flushed],
+        ..FakeEngine::default()
+    })
+}
+
+/// An engine that finalises a first phrase, then dies of a full GPU while the dictation goes
+/// on; its twin is on the CPU.
+fn gpu_full(cpu: &Arc<FakeEngine>) -> FakeEngine {
+    FakeEngine {
+        script: vec![
+            (0, EngineEvent::Ready),
+            (1_600, final_(1, "Bonjour")),
+            (
+                3_200,
+                EngineEvent::Ended(Err(Failure::GpuMemory(GPU_FULL.into()))),
+            ),
+        ],
+        // Dead: it says nothing more, whatever it is given.
+        hold_end: true,
+        cpu: Some(Arc::clone(cpu)),
+        ..FakeEngine::default()
+    }
+}
+
+/// Two seconds of audio, then the microphone ends, which stops the dictation.
+fn two_seconds() -> Arc<FakeMic> {
+    Arc::new(FakeMic {
+        chunks: Some(20),
+        ..FakeMic::default()
+    })
+}
+
+fn gpu_full_daemon(gpu: FakeEngine, paste: &FakePaste) -> Handle {
+    spawn(
+        two_seconds(),
+        Arc::new(gpu),
+        Some(Box::new(paste.clone())),
+        HOLD,
+        Arc::new(Instant::now),
+        no_vocabulary(),
+        Vec::new(),
+    )
+}
+
+#[test]
+fn gpu_memory_failure_decodes_the_dictation_again_on_the_cpu() {
+    let cpu = on_the_cpu();
+    let paste = FakePaste::in_window("org.example.Editor");
+    let daemon = gpu_full_daemon(gpu_full(&cpu), &paste);
+    dictate_to_the_end(&daemon, Command::Start);
+    // All of it: the audio before the failure and the audio after.
+    assert_eq!(cpu.heard.load(Ordering::SeqCst), 20 * 1_600);
+    // The phrase the GPU had finalised is in the CPU's text, not pasted twice.
+    assert_eq!(
+        handed(&paste),
+        [
+            Handed::Begin,
+            Handed::Phrase("Bonjour tout le monde.".into())
+        ]
+    );
+    assert_eq!(daemon.last(), ["Bonjour tout le monde."]);
+}
+
+#[test]
+fn gpu_memory_failure_is_announced_in_the_stream() {
+    let cpu = on_the_cpu();
+    let paste = FakePaste::in_window("org.example.Editor");
+    let daemon = gpu_full_daemon(gpu_full(&cpu), &paste);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&state(State::Listening));
+    // The dictation goes on: the microphone stays open until it is stopped.
+    watcher.expect(&[
+        ev_final(1, "Bonjour"),
+        Event::Fallback {
+            reason: GPU_FULL.into(),
+        },
+        state(State::Stopping),
+        ev_final(2, "Bonjour tout le monde."),
+        state(State::Idle),
+    ]);
+}
+
+#[test]
+fn gpu_memory_failure_is_counted_in_the_statistics() {
+    let cpu = on_the_cpu();
+    let paste = FakePaste::in_window("org.example.Editor");
+    let ledger = FakeLedger::default();
+    let daemon = recording_daemon(
+        Box::new(ledger.clone()),
+        two_seconds(),
+        Arc::new(gpu_full(&cpu)),
+        Some(&paste),
+        Arc::new(Instant::now),
+        Vec::new(),
+    );
+    dictate_to_the_end(&daemon, Command::Start);
+    let kept = ledger.kept();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert!(kept[0].cpu_fallback, "{kept:?}");
+    // The words of the CPU's text, not those the GPU had finalised as well.
+    assert_eq!(kept[0].words, 4);
+    assert_eq!(kept[0].audio_ms, 2_000);
+    assert!(kept[0].paste_ms.is_some(), "{kept:?}");
+}
+
+#[test]
+fn other_engine_failures_still_end_with_an_error() {
+    let cpu = on_the_cpu();
+    let engine = FakeEngine {
+        script: vec![
+            (0, EngineEvent::Ready),
+            (1_600, EngineEvent::Ended(Err("the engine stopped".into()))),
+        ],
+        cpu: Some(Arc::clone(&cpu)),
+        ..FakeEngine::default()
+    };
+    let (daemon, mic, _) = daemon(FakeMic::default(), engine);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&state(State::Listening));
+    watcher.expect(&[
+        Event::Error {
+            message: "the engine stopped".into(),
+        },
+        state(State::Idle),
+    ]);
+    wait_until("the microphone is closed", || {
+        mic.open_now.load(Ordering::SeqCst) == 0
+    });
+    assert_eq!(cpu.opens.load(Ordering::SeqCst), 0);
+}
+
+// The case of the issue: the encoder of a long phrase is built at the stop, when the GPU is full.
+#[test]
+fn a_gpu_memory_failure_after_the_stop_is_decoded_again_too() {
+    let cpu = on_the_cpu();
+    let gpu = Arc::new(FakeEngine {
+        script: vec![(0, EngineEvent::Ready)],
+        hold_end: true,
+        cpu: Some(Arc::clone(&cpu)),
+        ..FakeEngine::default()
+    });
+    let paste = FakePaste::in_window("org.example.Editor");
+    let daemon = spawn(
+        Arc::new(FakeMic::default()),
+        gpu.clone(),
+        Some(Box::new(paste.clone())),
+        HOLD,
+        Arc::new(Instant::now),
+        no_vocabulary(),
+        Vec::new(),
+    );
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&state(State::Listening));
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Stopping));
+    // crispasr dies after it has read the end of the audio: the audio is all in by then.
+    wait_until("the engine has the audio", || {
+        gpu.heard.load(Ordering::SeqCst) > 0
+    });
+    thread::sleep(Duration::from_millis(100));
+    gpu.emit(EngineEvent::Ended(Err(Failure::GpuMemory(GPU_FULL.into()))));
+    watcher.expect(&[
+        Event::Fallback {
+            reason: GPU_FULL.into(),
+        },
+        ev_final(1, "Bonjour tout le monde."),
+        state(State::Idle),
+    ]);
+    assert_eq!(
+        cpu.heard.load(Ordering::SeqCst),
+        gpu.heard.load(Ordering::SeqCst)
+    );
+    assert_eq!(
+        handed(&paste),
+        [
+            Handed::Begin,
+            Handed::Phrase("Bonjour tout le monde.".into())
+        ]
+    );
+}
+
+#[test]
+fn a_gpu_memory_failure_with_no_engine_on_the_cpu_is_an_error() {
+    let engine = FakeEngine {
+        script: vec![
+            (0, EngineEvent::Ready),
+            (
+                1_600,
+                EngineEvent::Ended(Err(Failure::GpuMemory(GPU_FULL.into()))),
+            ),
+        ],
+        ..FakeEngine::default()
+    };
+    let (daemon, _, _) = daemon(FakeMic::default(), engine);
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&state(State::Listening));
+    watcher.expect(&[
+        Event::Error {
+            message: format!("the GPU is out of memory: {GPU_FULL}"),
+        },
+        state(State::Idle),
+    ]);
 }

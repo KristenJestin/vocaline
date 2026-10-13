@@ -76,6 +76,7 @@ One JSON object per line, UTF-8, `type` names the event.
 | `partial` | `utterance`, `text` | the phrase being spoken, as heard so far; the next partial of the same utterance replaces it |
 | `final` | `utterance`, `text` | the phrase, frozen at the pause; it replaces the partials of its utterance and closes it |
 | `silence` | | the engine heard no speech in its last step (one per step, every `partial_ms`) |
+| `fallback` | `reason` | the GPU had no memory left for the engine, which died: the whole dictation is decoded again on the CPU once it stops; `reason` is the engine's line that said so |
 | `error` | `message` | something went wrong (a model file is missing, the engine could not start or stopped, or stopped by itself, with its last lines of diagnostics, the statistics could not be written); the state follows |
 
 The states:
@@ -111,4 +112,20 @@ The states:
   `final` ends with an ellipsis (`...` or `…`) or with no closing mark (`.`, `!`, `?`), drop the
   ellipsis and start the next one lowercase, unless its first word is `I`, in capitals, or has a
   capital inside; the README gives the rule. Otherwise the two are joined by a space.
+- A dictation the GPU had no memory for is not lost (since #38). The engine dies; the daemon
+  publishes a `fallback` and stays `listening` until the dictation is stopped, the microphone
+  still heard but nothing decoded. Once it stops, the whole dictation is decoded again on the
+  CPU as one recording: one `final` under a new `utterance` number, with no `partial`, after the
+  `stopping`, holds the text of all of it and replaces the phrases the dictation had before the
+  `fallback` (the paste, `last` and the statistics hold only that one). A reader that keeps the
+  phrases of a dictation drops them at the `fallback`. `idle` comes later than on the GPU: 1.6 s
+  after the stop for 17 s of dictation, 10 s for a minute, on an 8-core desktop CPU.
+
+  ```json
+  {"type":"final","utterance":4,"text":"Bonjour"}
+  {"type":"fallback","reason":"ggml_backend_cuda_buffer_type_alloc_buffer: allocating 232.73 MiB on device 0: cudaMalloc failed: out of memory"}
+  {"type":"state","state":"stopping"}
+  {"type":"final","utterance":5,"text":"Bonjour tout le monde, je voudrais tester la dictée."}
+  {"type":"state","state":"idle"}
+  ```
 - A reader that cannot keep up is disconnected rather than slowing the daemon down.

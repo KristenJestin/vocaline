@@ -6,7 +6,7 @@
 //! them an unbounded queue: the microphone is never held back by an engine still loading.
 
 use crate::audio::{Capture, Microphone, SAMPLE_RATE, rms};
-use crate::engine::{Engine, EngineEvent, EngineInput};
+use crate::engine::{Engine, EngineEvent, EngineInput, Failure};
 use crate::events::{Event, State, VERSION};
 use crate::output::Paste;
 use crate::phrases::{self, Fillers};
@@ -136,6 +136,8 @@ enum Message {
     /// From the dictation numbered by the first field.
     Engine(u64, EngineEvent),
     CaptureEnded(u64, Option<String>),
+    /// All the audio of the dictation, once the microphone has closed.
+    Heard(u64, Vec<i16>),
 }
 
 #[derive(Clone)]
@@ -237,6 +239,9 @@ pub fn spawn_recording(
         rules,
         rule: None,
         last: VecDeque::new(),
+        shown: 0,
+        heard: None,
+        cpu: None,
         ledger,
         tally: None,
         stopped_at: None,
@@ -283,6 +288,14 @@ struct Core {
     rule: Option<Rule>,
     /// The last finals, as shown; in memory only, for `last`.
     last: VecDeque<String>,
+    /// How many of them the current dictation added.
+    shown: usize,
+    /// All the audio of the current dictation, once the microphone has closed: the engine may
+    /// still die of a full GPU while it finishes. In memory only, dropped when it ends.
+    heard: Option<Vec<i16>>,
+    /// The engine that decodes the dictation again, once its audio is all heard: the GPU had no
+    /// memory left for the first one.
+    cpu: Option<Arc<dyn Engine>>,
     ledger: Option<Box<dyn Ledger>>,
     /// What is counted of the current dictation, to be kept when it ends.
     tally: Option<Tally>,
@@ -296,6 +309,7 @@ struct Tally {
     words: u32,
     /// The samples the pump has read, which it keeps adding to until the microphone closes.
     samples: Arc<AtomicU64>,
+    cpu_fallback: bool,
 }
 
 impl Core {
@@ -325,7 +339,13 @@ impl Core {
                     self.set(State::Stopping);
                 }
             }
-            Message::Engine(..) | Message::CaptureEnded(..) => {}
+            Message::Heard(dictation, audio) if dictation == self.dictation => {
+                if self.state != State::Idle {
+                    self.heard = Some(audio);
+                    self.decode_on_cpu();
+                }
+            }
+            Message::Engine(..) | Message::CaptureEnded(..) | Message::Heard(..) => {}
         }
     }
 
@@ -410,7 +430,8 @@ impl Core {
         self.stop = Arc::new(AtomicBool::new(false));
         self.open_utterance = None;
         let (audio, queue) = mpsc::channel();
-        thread::spawn(move || feed(input, queue));
+        let messages = self.messages.clone();
+        thread::spawn(move || feed(input, queue, messages, dictation));
         let samples = Arc::new(AtomicU64::new(0));
         let pump = Pump {
             samples: Arc::clone(&samples),
@@ -437,7 +458,11 @@ impl Core {
                 .unwrap_or_else(|| stats::UNKNOWN.into()),
             words: 0,
             samples,
+            cpu_fallback: false,
         });
+        self.shown = 0;
+        self.heard = None;
+        self.cpu = None;
         self.stopped_at = None;
         self.read_vocabulary();
         self.set(State::Loading);
@@ -495,6 +520,7 @@ impl Core {
                         self.last.pop_front();
                     }
                     self.last.push_back(text.clone());
+                    self.shown += 1;
                     if let Some(tally) = &mut self.tally {
                         tally.words += stats::count_words(&text);
                     }
@@ -511,6 +537,14 @@ impl Core {
             EngineEvent::Flushed if self.state == State::Stopping => self.paste_dictation(),
             EngineEvent::Flushed => {}
             EngineEvent::Ended(result) => {
+                let result = match result {
+                    Err(Failure::GpuMemory(line)) => match self.cpu_for_fallback() {
+                        Some(cpu) => return self.fall_back(cpu, line),
+                        None => Err(format!("the GPU is out of memory: {line}")),
+                    },
+                    Err(Failure::Other(message)) => Err(message),
+                    Ok(()) => Ok(()),
+                };
                 match result {
                     Err(message) => self.bus.publish(&Event::Error { message }),
                     // No stop was asked, or the state would be `Stopping`: an engine that
@@ -525,8 +559,71 @@ impl Core {
                 // The engine may have failed while the microphone is still open.
                 self.stop.store(true, Ordering::SeqCst);
                 self.paste_dictation();
+                self.heard = None;
+                self.cpu = None;
                 self.set(State::Idle);
             }
+        }
+    }
+
+    /// The engine to decode the dictation again with, if it has not been pasted yet and has not
+    /// fallen back already.
+    fn cpu_for_fallback(&self) -> Option<Arc<dyn Engine>> {
+        self.tally.as_ref().filter(|tally| !tally.cpu_fallback)?;
+        self.engine.on_cpu()
+    }
+
+    /// The GPU had no memory left for the engine: the whole dictation is decoded again on the
+    /// CPU once its audio is all heard, which a dictation still going on waits for. That is a
+    /// single decode, through the same paste, and no word spoken after the failure is lost.
+    fn fall_back(&mut self, cpu: Arc<dyn Engine>, reason: String) {
+        eprintln!(
+            "vocaline: the GPU is out of memory, the dictation is decoded on the CPU: {reason}"
+        );
+        self.bus.publish(&Event::Fallback { reason });
+        // The CPU's text holds them: they would be pasted and counted twice.
+        self.dictated.clear();
+        for _ in 0..self.shown {
+            self.last.pop_back();
+        }
+        self.shown = 0;
+        if let Some(tally) = &mut self.tally {
+            tally.words = 0;
+            tally.cpu_fallback = true;
+        }
+        self.open_utterance = None;
+        self.cpu = Some(cpu);
+        if self.state == State::Loading {
+            self.set(State::Listening);
+        }
+        self.decode_on_cpu();
+    }
+
+    /// Starts the decode on the CPU once its engine is chosen and the audio all heard, whichever
+    /// comes second. Its events are those of the dictation.
+    fn decode_on_cpu(&mut self) {
+        let (cpu, heard) = match (self.cpu.take(), self.heard.take()) {
+            (Some(cpu), Some(heard)) => (cpu, heard),
+            (cpu, heard) => {
+                (self.cpu, self.heard) = (cpu, heard);
+                return;
+            }
+        };
+        let dictation = self.dictation;
+        let messages = self.messages.clone();
+        match cpu.open(Box::new(move |event| {
+            let _ = messages.send(Message::Engine(dictation, event));
+        })) {
+            Ok(mut input) => {
+                thread::spawn(move || {
+                    if input.write(&heard).is_ok() {
+                        input.finish();
+                    }
+                });
+            }
+            Err(e) => self.engine_event(EngineEvent::Ended(Err(Failure::Other(format!(
+                "the engine could not start on the CPU: {e}"
+            ))))),
         }
     }
 
@@ -577,6 +674,7 @@ impl Core {
                 .stopped_at
                 .filter(|_| pasted)
                 .map(|at| (self.clock)().saturating_duration_since(at).as_millis() as u64),
+            cpu_fallback: tally.cpu_fallback,
         };
         if let Err(e) = ledger.record(&dictation) {
             self.bus.publish(&Event::Error {
@@ -652,14 +750,30 @@ impl Pump {
 }
 
 /// Writes the queued audio to the engine, then ends its stream, which finalises the open phrase.
-fn feed(mut input: Box<dyn EngineInput>, queue: mpsc::Receiver<Vec<i16>>) {
+/// The audio is kept as well, and handed to the daemon at the end: an engine that died of a full
+/// GPU has it all decoded again on the CPU.
+fn feed(
+    input: Box<dyn EngineInput>,
+    queue: mpsc::Receiver<Vec<i16>>,
+    messages: mpsc::Sender<Message>,
+    dictation: u64,
+) {
+    let mut input = Some(input);
+    let mut heard = Vec::new();
     for chunk in queue {
+        heard.extend_from_slice(&chunk);
         // The engine has gone: it reports why through its own events.
-        if input.write(&chunk).is_err() {
-            return;
+        if input
+            .as_mut()
+            .is_some_and(|input| input.write(&chunk).is_err())
+        {
+            input = None;
         }
     }
-    input.finish();
+    if let Some(input) = input {
+        input.finish();
+    }
+    let _ = messages.send(Message::Heard(dictation, heard));
 }
 
 /// The watchers of the event stream.
