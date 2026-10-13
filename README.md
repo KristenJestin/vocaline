@@ -157,16 +157,20 @@ the focus is).
 
 The phrase goes through the clipboard and a paste shortcut typed by `wtype`: Ctrl+Shift+V in a
 terminal (foot, Alacritty, kitty, Ghostty, WezTerm…), Ctrl+V elsewhere. The clipboard is put
-back as it was, with every type it held (a screenshot stays a screenshot), 400 ms after the
-paste: the application reads the clipboard on its own time after the shortcut. The text is
-offered with the `x-kde-passwordManagerHint` type, so a clipboard history that honours it keeps
-no copy of what was dictated.
+back as it was, with every type it held (a screenshot stays a screenshot), once the application
+has read the phrase and at least 400 ms after the paste: the application reads the clipboard on
+its own time after the shortcut, and a busy one (an Electron app whose main thread is held up)
+reads it a second later. One that has not read it after 2 s is taken as having dropped the
+shortcut. The shortcut is typed once the compositor holds the phrase, and 15 ms after the last
+read of it by a clipboard history, which reads each new selection at once. The text is offered
+with the `x-kde-passwordManagerHint` type, so a clipboard history that honours it keeps no copy
+of what was dictated.
 
 While a modifier is held (SUPER of SUPER+A, Ctrl, Alt, Shift), the paste waits for its release:
 pressed with it, the shortcut would be another one.
 
 It needs Hyprland with its Lua API (it is asked which window has the focus and which keys are
-down), `wtype`, and a compositor with the Wayland data-control protocol. `vocaline start
+down), `wtype`, and a compositor with the Wayland ext-data-control protocol. `vocaline start
 --no-paste`, or `paste = false`, leaves the phrases in the event stream only.
 
 ## Rules per application

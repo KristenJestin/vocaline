@@ -522,10 +522,13 @@ name = "vocaline"
 version = "0.1.1"
 dependencies = [
  "jiff",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
  "toml",
+ "wayland-client",
+ "wayland-protocols",
  "wl-clipboard-rs",
 ]
 

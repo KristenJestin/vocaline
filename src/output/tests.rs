@@ -87,7 +87,33 @@ impl Desktop for FakeDesktop {
 
 struct FakeClipboard {
     contents: Mutex<Contents>,
+    /// Where the reads of the phrase offered last are told.
+    reads: Mutex<Option<mpsc::Sender<Instant>>>,
+    /// A clipboard history reads every new selection this long after it is set, whatever
+    /// the shortcut.
+    watched: Mutex<Option<Duration>>,
     log: Arc<Log>,
+}
+
+impl FakeClipboard {
+    /// An application reads the clipboard: it gets the text it holds, and the read is told.
+    fn read(&self, asked: Instant) -> String {
+        let text = self.read_quietly();
+        if let Some(reads) = self.reads.lock().unwrap().as_ref() {
+            let _ = reads.send(asked);
+        }
+        text
+    }
+
+    /// What the clipboard holds, looked at without reading it as an application would.
+    fn read_quietly(&self) -> String {
+        let contents = self.contents.lock().unwrap();
+        contents
+            .iter()
+            .find(|(mime, _)| mime == "text/plain")
+            .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
+            .unwrap_or_default()
+    }
 }
 
 impl Clipboard for FakeClipboard {
@@ -96,29 +122,84 @@ impl Clipboard for FakeClipboard {
         Ok(self.contents.lock().unwrap().clone())
     }
 
-    fn set_text(&self, text: &str) -> io::Result<()> {
+    fn set_text(&self, text: &str) -> io::Result<mpsc::Receiver<Instant>> {
         *self.contents.lock().unwrap() = vec![("text/plain".into(), text.as_bytes().to_vec())];
+        let (reads, offer) = mpsc::channel();
+        match *self.watched.lock().unwrap() {
+            Some(after) if after.is_zero() => {
+                let _ = reads.send(Instant::now());
+            }
+            Some(after) => {
+                let reads = reads.clone();
+                thread::spawn(move || {
+                    thread::sleep(after);
+                    let _ = reads.send(Instant::now());
+                });
+            }
+            None => {}
+        }
+        *self.reads.lock().unwrap() = Some(reads);
         self.log.push(Did::Set(text.into()));
-        Ok(())
+        Ok(offer)
     }
 
     fn restore(&self, contents: Contents) -> io::Result<()> {
+        *self.reads.lock().unwrap() = None;
         *self.contents.lock().unwrap() = contents.clone();
         self.log.push(Did::Restore(contents));
         Ok(())
     }
 }
 
+/// The keyboard, and the application behind it: on the paste shortcut it reads the clipboard,
+/// at once or later (as a busy application does), or never.
 struct FakeKeyboard {
+    clipboard: Arc<FakeClipboard>,
+    reads_after: Mutex<Option<Duration>>,
+    /// What the clipboard held when the shortcut was pressed.
+    held: Mutex<Vec<String>>,
+    /// What the application pasted, in order.
+    pasted: Arc<Mutex<Vec<String>>>,
     log: Arc<Log>,
 }
 
 impl Keyboard for FakeKeyboard {
     fn press(&self, shortcut: Shortcut) -> io::Result<()> {
         self.log.push(Did::Press(shortcut));
+        if shortcut == Shortcut::Enter {
+            return Ok(());
+        }
+        let asked = Instant::now();
+        self.held
+            .lock()
+            .unwrap()
+            .push(self.clipboard.read_quietly());
+        match *self.reads_after.lock().unwrap() {
+            Some(after) if after.is_zero() => {
+                let text = self.clipboard.read(asked);
+                self.pasted.lock().unwrap().push(text);
+            }
+            Some(after) => {
+                let clipboard = Arc::clone(&self.clipboard);
+                let pasted = Arc::clone(&self.pasted);
+                thread::spawn(move || {
+                    thread::sleep(after);
+                    let text = clipboard.read(Instant::now());
+                    pasted.lock().unwrap().push(text);
+                });
+            }
+            None => {}
+        }
         Ok(())
     }
 }
+
+/// How long the test setup gives the application to read the phrase.
+const UNREAD: Duration = Duration::from_millis(400);
+/// A busy application: it reads the clipboard well after the settle of the test setup.
+const BUSY: Duration = Duration::from_millis(150);
+/// How long the test setup lets a clipboard history read the phrase before the shortcut.
+const QUIET: Duration = Duration::from_millis(20);
 
 const EDITOR: &str = "0xe";
 const TERMINAL: &str = "0xt";
@@ -135,6 +216,7 @@ struct Setup {
     output: Output,
     desktop: Arc<FakeDesktop>,
     clipboard: Arc<FakeClipboard>,
+    keyboard: Arc<FakeKeyboard>,
     log: Arc<Log>,
 }
 
@@ -150,30 +232,60 @@ fn setup() -> Setup {
     });
     let clipboard = Arc::new(FakeClipboard {
         contents: Mutex::new(screenshot()),
+        reads: Mutex::new(None),
+        watched: Mutex::new(None),
+        log: Arc::clone(&log),
+    });
+    let keyboard = Arc::new(FakeKeyboard {
+        clipboard: Arc::clone(&clipboard),
+        reads_after: Mutex::new(Some(Duration::ZERO)),
+        held: Mutex::new(Vec::new()),
+        pasted: Arc::new(Mutex::new(Vec::new())),
         log: Arc::clone(&log),
     });
     let output = Output::spawn(
         Ports {
             desktop: desktop.clone(),
             clipboard: clipboard.clone(),
-            keyboard: Arc::new(FakeKeyboard {
-                log: Arc::clone(&log),
-            }),
+            keyboard: keyboard.clone(),
         },
         Timing {
             poll: Duration::from_millis(2),
             settle: Duration::from_millis(30),
+            unread: UNREAD,
+            quiet: QUIET,
         },
     );
     Setup {
         output,
         desktop,
         clipboard,
+        keyboard,
         log,
     }
 }
 
 impl Setup {
+    fn application_reads_after(&self, after: Option<Duration>) {
+        *self.keyboard.reads_after.lock().unwrap() = after;
+    }
+
+    fn pasted(&self) -> Vec<String> {
+        self.keyboard.pasted.lock().unwrap().clone()
+    }
+
+    fn wait_for_pastes(&self, count: usize) -> Vec<String> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let pasted = self.pasted();
+            if pasted.len() >= count {
+                return pasted;
+            }
+            assert!(Instant::now() < deadline, "only {pasted:?}");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     fn click(&self, address: &str) {
         let window = self
             .desktop
@@ -447,4 +559,79 @@ fn enter_is_not_pressed_when_nothing_was_pasted() {
     s.output.enter();
     thread::sleep(Duration::from_millis(100));
     assert_eq!(s.log.all(), []);
+}
+
+#[test]
+fn the_shortcut_is_pressed_once_the_clipboard_holds_the_phrase() {
+    let s = setup();
+    s.begin();
+    s.output.phrase("Un.".into());
+    s.output.phrase("Deux.".into());
+    s.log.wait_for(6);
+    assert_eq!(*s.keyboard.held.lock().unwrap(), ["Un.", " Deux."]);
+}
+
+#[test]
+fn the_user_clipboard_is_not_restored_before_the_application_reads_the_phrase() {
+    let s = setup();
+    s.application_reads_after(Some(BUSY));
+    s.begin();
+    s.output.phrase("Bonjour.".into());
+    assert_eq!(s.wait_for_pastes(1), ["Bonjour."]);
+    s.log.wait_for(4);
+    assert_eq!(*s.clipboard.contents.lock().unwrap(), screenshot());
+}
+
+#[test]
+fn a_read_before_the_shortcut_does_not_count_as_the_paste() {
+    let s = setup();
+    *s.clipboard.watched.lock().unwrap() = Some(Duration::ZERO);
+    s.application_reads_after(Some(BUSY));
+    s.begin();
+    s.output.phrase("Bonjour.".into());
+    assert_eq!(s.wait_for_pastes(1), ["Bonjour."]);
+}
+
+#[test]
+fn the_clipboard_is_put_back_when_the_application_never_reads_the_phrase() {
+    let s = setup();
+    s.application_reads_after(None);
+    s.begin();
+    s.output.phrase("Bonjour.".into());
+    s.log.wait_for(4);
+    let gap = s.log.when(&Did::Restore(screenshot())) - s.log.when(&Did::Press(Shortcut::CtrlV));
+    assert!(gap >= UNREAD, "{gap:?}");
+}
+
+#[test]
+fn the_next_phrase_waits_until_the_application_read_the_last_one() {
+    let s = setup();
+    s.application_reads_after(Some(BUSY));
+    s.begin();
+    s.output.phrase("Un.".into());
+    s.output.phrase("Deux.".into());
+    assert_eq!(s.wait_for_pastes(2), ["Un.", " Deux."]);
+}
+
+#[test]
+fn enter_waits_until_the_application_read_the_phrase() {
+    let s = setup();
+    s.application_reads_after(Some(BUSY));
+    s.begin();
+    s.output.phrase("ls -la".into());
+    s.output.enter();
+    s.log.wait_for(4);
+    s.wait_for_pastes(1);
+    let gap = s.log.when(&Did::Press(Shortcut::Enter)) - s.log.when(&Did::Press(Shortcut::CtrlV));
+    assert!(gap >= BUSY, "{gap:?}");
+}
+
+#[test]
+fn a_clipboard_history_that_reads_the_phrase_late_is_let_through_before_the_shortcut() {
+    let s = setup();
+    *s.clipboard.watched.lock().unwrap() = Some(QUIET / 2);
+    s.application_reads_after(Some(BUSY));
+    s.begin();
+    s.output.phrase("Bonjour.".into());
+    assert_eq!(s.wait_for_pastes(1), ["Bonjour."]);
 }
