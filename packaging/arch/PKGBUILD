@@ -89,7 +89,8 @@ build() {
   # The prebuilt CUDA 13 bundle's setup: the ggml backends are loaded at run time, so the same
   # binary runs on the CPU where CUDA is missing, with a CPU variant per generation (x64 to
   # Sapphire Rapids and Zen 4). CUDA from Turing (sm_75) to Blackwell (sm_120), plus PTX for
-  # what comes after. Every library is found beside crispasr, wherever it is installed.
+  # what comes after. Every library is built into bin/ and found beside crispasr, wherever it
+  # is installed (the tests' Catch2 too, so they run from there).
   cmake -S "$srcdir/crispasr" -B "$srcdir/crispasr-build" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_SHARED_LIBS=ON \
@@ -100,6 +101,7 @@ build() {
     -DCMAKE_CUDA_COMPILER=/opt/cuda/bin/nvcc \
     -DCMAKE_CUDA_HOST_COMPILER="$(sed -n "s/^export NVCC_CCBIN='\(.*\)'$/\1/p" /etc/profile.d/cuda.sh)" \
     -DCMAKE_CUDA_ARCHITECTURES='75-real;80-real;86-real;89-real;90-real;90-virtual;120a-real;120-virtual' \
+    -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="$srcdir/crispasr-build/bin" \
     -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
     -DCMAKE_INSTALL_RPATH='$ORIGIN' \
     -DCRISPASR_BUILD_EXAMPLES=ON \
@@ -134,7 +136,8 @@ package() {
   # The engine keeps the layout of the prebuilt bundle: crispasr finds its libraries beside itself.
   local engine="$pkgdir/usr/lib/vocaline/crispasr"
   install -Dm755 -t "$engine" "$srcdir/crispasr-build/bin/crispasr"
-  cp -P "$srcdir/crispasr-build/bin"/{libcrispasr,libggml}*.so* "$engine/"
+  cp -P "$srcdir/crispasr-build/bin"/{libcrispasr,libggml,libggml-base}.so.* \
+    "$srcdir/crispasr-build/bin"/libggml-{cpu-*,cuda}.so "$engine/"
   install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname/crispasr" \
     "$srcdir/crispasr"/{LICENSE,THIRD_PARTY_NOTICES.txt} "$srcdir/crispasr-short-context.patch"
 }

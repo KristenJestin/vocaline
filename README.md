@@ -93,8 +93,9 @@ To build only the patched CrispASR, from a clone of it at `v0.8.42` with its sub
 ```sh
 git apply /path/to/vocaline/packaging/arch/crispasr-short-context.patch
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON \
-  -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON -DGGML_CUDA=ON -DCMAKE_INSTALL_RPATH='$ORIGIN' \
-  -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+  -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON -DGGML_CUDA=ON \
+  -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="$PWD/build/bin" -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+  -DCMAKE_INSTALL_RPATH='$ORIGIN'
 cmake --build build --target crispasr-cli   # build/bin: crispasr and its libraries
 ```
 
