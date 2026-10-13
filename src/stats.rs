@@ -25,6 +25,9 @@ pub struct Dictation {
     /// From the stop to the hand-over of the text to the output; none when nothing was pasted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paste_ms: Option<u64>,
+    /// The GPU had no memory left for it: it was decoded again on the CPU.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cpu_fallback: bool,
 }
 
 /// A line of the store.
@@ -111,6 +114,8 @@ pub struct Totals {
     pub words: u64,
     pub audio_ms: u64,
     pub paste: Option<Latency>,
+    /// The dictations decoded again on the CPU because the GPU had no memory left.
+    pub cpu_fallbacks: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -211,6 +216,7 @@ fn totals(entries: &[&Entry]) -> Totals {
         words: entries.iter().map(|e| u64::from(e.dictation.words)).sum(),
         audio_ms: entries.iter().map(|e| e.dictation.audio_ms).sum(),
         paste,
+        cpu_fallbacks: entries.iter().filter(|e| e.dictation.cpu_fallback).count() as u32,
     }
 }
 
@@ -266,6 +272,13 @@ impl Report {
                 out,
                 "  stop to paste: median {} ms, max {} ms",
                 paste.median_ms, paste.max_ms
+            );
+        }
+        if summary.totals.cpu_fallbacks > 0 {
+            let _ = writeln!(
+                out,
+                "  decoded on the CPU, the GPU being full: {}",
+                summary.totals.cpu_fallbacks
             );
         }
         let _ = writeln!(out, "  by application");

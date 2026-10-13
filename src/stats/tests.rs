@@ -15,6 +15,7 @@ fn entry(day: Date, app: &str, words: u32, audio_ms: u64, paste_ms: Option<u64>)
             words,
             audio_ms,
             paste_ms,
+            cpu_fallback: false,
         },
     }
 }
@@ -195,6 +196,7 @@ fn a_dictation_is_appended_as_one_line_of_counts_and_durations() {
         words: 12,
         audio_ms: 4_500,
         paste_ms: Some(320),
+        cpu_fallback: false,
     };
     store.record(&dictation).unwrap();
     store
@@ -249,6 +251,7 @@ fn the_json_has_the_three_periods_with_their_groups() {
             words: 7,
             audio_ms: 3_000,
             paste_ms: Some(250),
+            cpu_fallback: false,
         })
         .unwrap();
     let mut out = Vec::new();
@@ -274,4 +277,53 @@ fn the_text_is_printed_from_the_store_without_the_daemon() {
     let mut out = Vec::new();
     print(&store, TODAY, false, &mut out).unwrap();
     assert!(String::from_utf8(out).unwrap().contains("no dictation"));
+}
+
+// The GPU is shared: how often it had no memory for a dictation tells whether to change the setup.
+#[test]
+fn the_dictations_decoded_again_on_the_cpu_are_counted() {
+    let mut entries = sample();
+    entries[5].dictation.cpu_fallback = true;
+    entries[2].dictation.cpu_fallback = true;
+    let counted = report(&entries, TODAY);
+    assert_eq!(counted.today.totals.cpu_fallbacks, 1);
+    assert_eq!(counted.last_7_days.totals.cpu_fallbacks, 2);
+    assert_eq!(counted.today.by_application[0].totals.cpu_fallbacks, 1);
+    let text = counted.text();
+    assert!(
+        text.contains("decoded on the CPU, the GPU being full: 1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("decoded on the CPU, the GPU being full: 2"),
+        "{text}"
+    );
+    let quiet = report(&sample(), TODAY).text();
+    assert!(!quiet.contains("on the CPU"), "{quiet}");
+}
+
+#[test]
+fn a_dictation_on_the_gpu_writes_no_fallback_field() {
+    let store = Store::new(folder("fallback").join("stats.jsonl"));
+    let dictation = Dictation {
+        app: "org.example.Editor".into(),
+        words: 3,
+        audio_ms: 1_000,
+        paste_ms: None,
+        cpu_fallback: false,
+    };
+    store.record(&dictation).unwrap();
+    store
+        .record(&Dictation {
+            cpu_fallback: true,
+            ..dictation.clone()
+        })
+        .unwrap();
+    let written = std::fs::read_to_string(&store.path).unwrap();
+    let lines: Vec<&str> = written.lines().collect();
+    assert!(!lines[0].contains("cpu_fallback"), "{written}");
+    assert!(lines[1].ends_with(",\"cpu_fallback\":true}"), "{written}");
+    let (entries, _) = store.read().unwrap();
+    assert!(!entries[0].dictation.cpu_fallback);
+    assert!(entries[1].dictation.cpu_fallback);
 }
