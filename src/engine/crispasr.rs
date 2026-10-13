@@ -3,8 +3,12 @@
 //!
 //! One process per dictation: the model is loaded when listening starts and unloaded when the
 //! process ends, after the end of the audio has finalised the open phrase.
+//!
+//! A dictation the GPU had no memory for is decoded again on the CPU as one recording: a WAV on
+//! the standard input of `crispasr -f -`, its text on the standard output.
 
 use super::{Engine, EngineEvent, EngineInput, Failure, Sink};
+use crate::audio::SAMPLE_RATE;
 use crate::config::{Backend, EngineConfig};
 use serde::Deserialize;
 use std::collections::VecDeque;
@@ -23,24 +27,45 @@ const KEPT_BYTES: usize = 400;
 
 pub struct CrispAsr {
     config: EngineConfig,
+    /// The audio is decoded as one recording once it has all come, not as a stream.
+    whole: bool,
 }
 
 impl CrispAsr {
     pub fn new(config: EngineConfig) -> CrispAsr {
-        CrispAsr { config }
+        CrispAsr {
+            config,
+            whole: false,
+        }
     }
 
-    /// The same configuration, on the CPU.
+    /// The same model on the CPU, for a recording the GPU had no memory for. Streamed, its
+    /// partials are decoded again at every step: 17 s of dictation took 14 s after the stop and
+    /// 61 s of CPU, against 1.5 s and 8 s as one recording, measured.
     fn cpu_twin(&self) -> CrispAsr {
-        CrispAsr::new(EngineConfig {
-            backend: Backend::Cpu,
-            ..self.config.clone()
-        })
+        CrispAsr {
+            config: EngineConfig {
+                backend: Backend::Cpu,
+                ..self.config.clone()
+            },
+            whole: true,
+        }
     }
 
     fn command(&self) -> Command {
         let c = &self.config;
         let mut command = Command::new(&c.command);
+        if self.whole {
+            command
+                .arg("-m")
+                .arg(&c.model)
+                .args(["-l", &c.language, "--gpu-backend", c.backend.name()])
+                .args(["--vad", "--vad-model", &c.vad_model])
+                .args(["-f", "-", "-np"])
+                // The GPU had no memory left: not even a CUDA context is asked of it.
+                .env("CUDA_VISIBLE_DEVICES", "");
+            return command;
+        }
         // No `--backend`: crispasr reads the engine family from the model file, so Parakeet
         // (light, but it ignores `-l` and drifts into English on short phrases) and Canary
         // (which obeys `-l`, for several times the CPU) are one line of configuration apart.
@@ -133,18 +158,32 @@ impl Engine for CrispAsr {
             }
         });
 
+        let whole = self.whole;
         thread::spawn(move || {
             let mut ready = false;
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let Some(event) = parse_line(&line) else {
-                    continue;
-                };
-                // The first event comes after the first step: the model is loaded by then.
-                if !ready {
-                    ready = true;
-                    sink(EngineEvent::Ready);
+            let lines = BufReader::new(stdout).lines().map_while(Result::ok);
+            if whole {
+                // One line of text for the whole recording; more than one is joined.
+                let text = lines.collect::<Vec<_>>().join(" ");
+                let text = text.trim();
+                if !text.is_empty() {
+                    sink(EngineEvent::Final {
+                        utterance: 1,
+                        text: text.into(),
+                    });
                 }
-                sink(event);
+            } else {
+                for line in lines {
+                    let Some(event) = parse_line(&line) else {
+                        continue;
+                    };
+                    // The first event comes after the first step: the model is loaded by then.
+                    if !ready {
+                        ready = true;
+                        sink(EngineEvent::Ready);
+                    }
+                    sink(event);
+                }
             }
             let _ = diagnostics_thread.join();
             let gpu_full = gpu_full.lock().unwrap().take();
@@ -166,7 +205,11 @@ impl Engine for CrispAsr {
             };
             sink(EngineEvent::Ended(result));
         });
-        Ok(Box::new(Input { stdin, finished }))
+        Ok(Box::new(Input {
+            stdin,
+            finished,
+            recording: self.whole.then(Vec::new),
+        }))
     }
 
     fn on_cpu(&self) -> Option<Arc<dyn Engine>> {
@@ -199,18 +242,53 @@ struct Input {
     stdin: ChildStdin,
     /// Set once the audio has ended, so the exit that follows is the one that was asked for.
     finished: Arc<AtomicBool>,
+    /// The audio of a recording decoded as one, in memory until it has all come: a WAV
+    /// header holds its length.
+    recording: Option<Vec<i16>>,
 }
 
 impl EngineInput for Input {
     fn write(&mut self, pcm: &[i16]) -> io::Result<()> {
-        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
-        self.stdin.write_all(&bytes)
+        if let Some(recording) = &mut self.recording {
+            recording.extend_from_slice(pcm);
+            return Ok(());
+        }
+        self.stdin.write_all(&le_bytes(pcm))
     }
 
     /// Closing the standard input is how crispasr learns the audio ended.
-    fn finish(self: Box<Self>) {
+    fn finish(mut self: Box<Self>) {
         self.finished.store(true, Ordering::SeqCst);
+        if let Some(recording) = self.recording.take() {
+            let mut wav = wav_header(recording.len());
+            wav.extend(le_bytes(&recording));
+            // An engine that has gone reports why through its own events.
+            let _ = self.stdin.write_all(&wav);
+        }
     }
+}
+
+fn le_bytes(pcm: &[i16]) -> Vec<u8> {
+    pcm.iter().flat_map(|s| s.to_le_bytes()).collect()
+}
+
+/// The header of a 16 kHz mono 16-bit WAV of `samples` samples.
+fn wav_header(samples: usize) -> Vec<u8> {
+    let data = (samples * 2) as u32;
+    let mut header = Vec::with_capacity(44);
+    header.extend(b"RIFF");
+    header.extend((36 + data).to_le_bytes());
+    header.extend(b"WAVEfmt ");
+    header.extend(16u32.to_le_bytes());
+    header.extend(1u16.to_le_bytes()); // PCM
+    header.extend(1u16.to_le_bytes()); // mono
+    header.extend(SAMPLE_RATE.to_le_bytes());
+    header.extend((SAMPLE_RATE * 2).to_le_bytes());
+    header.extend(2u16.to_le_bytes());
+    header.extend(16u16.to_le_bytes());
+    header.extend(b"data");
+    header.extend(data.to_le_bytes());
+    header
 }
 
 #[derive(Deserialize)]
@@ -407,6 +485,14 @@ mod tests {
         script_name: &str,
         script: &str,
     ) -> (Box<dyn EngineInput>, mpsc::Receiver<EngineEvent>) {
+        open_fake_with(script_name, script, CrispAsr::new)
+    }
+
+    fn open_fake_with(
+        script_name: &str,
+        script: &str,
+        engine: impl Fn(EngineConfig) -> CrispAsr,
+    ) -> (Box<dyn EngineInput>, mpsc::Receiver<EngineEvent>) {
         let config = EngineConfig {
             command: fake_crispasr(script_name, script),
             ..EngineConfig::default()
@@ -419,7 +505,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         let input = loop {
             let tx = Mutex::new(tx.clone());
-            match CrispAsr::new(config.clone())
+            match engine(config.clone())
                 .open(Box::new(move |e| tx.lock().unwrap().send(e).unwrap()))
             {
                 Err(e)
@@ -570,24 +656,67 @@ mod tests {
         );
     }
 
+    // Streamed on the CPU, 17 s of dictation took 14 s to decode after the stop and 61 s of CPU,
+    // its partials decoded again at every step; decoded as one recording, 1.5 s and 8 s.
     #[test]
-    fn the_engine_on_the_cpu_is_the_same_engine_with_the_cpu_backend() {
+    fn the_engine_on_the_cpu_decodes_the_whole_recording_at_once() {
         let config = EngineConfig {
             model: "/models/p.gguf".into(),
+            vad_model: "auto".into(),
             ..EngineConfig::default()
         };
         let gpu = CrispAsr::new(config);
         assert!(gpu.on_cpu().is_some());
         let cpu = gpu.cpu_twin();
         assert!(cpu.on_cpu().is_none(), "the CPU is the last resort");
-        let args: Vec<String> = cpu
-            .command()
-            .get_args()
-            .map(|a| a.to_str().unwrap().to_string())
+        let command = cpu.command();
+        let args: Vec<&str> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+        let joined = args.join(" ");
+        for expected in [
+            "-m /models/p.gguf -l fr --gpu-backend cpu",
+            "--vad --vad-model auto",
+            "-f - -np",
+        ] {
+            assert!(
+                joined.contains(expected),
+                "{expected} missing from {joined}"
+            );
+        }
+        assert!(!args.contains(&"--stream"), "{joined}");
+        // A GPU with no memory left is not even asked for a CUDA context.
+        let hidden = command
+            .get_envs()
+            .find(|(k, _)| *k == "CUDA_VISIBLE_DEVICES")
+            .and_then(|(_, v)| v.map(|v| v.to_owned()));
+        assert_eq!(hidden, Some("".into()));
+    }
+
+    #[test]
+    fn on_the_cpu_the_audio_goes_as_one_wav_and_its_text_is_one_final() {
+        let script = r#"
+            header=$(head -c 4)
+            rest=$(wc -c)
+            echo "Bonjour, $header and $rest bytes."
+            echo 'Ça va ?'
+        "#;
+        let (mut input, rx) =
+            open_fake_with("whole", script, |config| CrispAsr::new(config).cpu_twin());
+        input.write(&[1, 2, 3]).unwrap();
+        input.write(&[4]).unwrap();
+        input.finish();
+        let events: Vec<EngineEvent> = (0..2)
+            .map(|_| rx.recv_timeout(Duration::from_secs(5)).unwrap())
             .collect();
-        assert!(
-            args.join(" ")
-                .contains("-m /models/p.gguf -l fr --gpu-backend cpu")
+        // 40 bytes of header after `RIFF`, then 4 samples of 2 bytes.
+        assert_eq!(
+            events,
+            [
+                EngineEvent::Final {
+                    utterance: 1,
+                    text: "Bonjour, RIFF and 48 bytes. Ça va ?".into()
+                },
+                EngineEvent::Ended(Ok(())),
+            ]
         );
     }
 

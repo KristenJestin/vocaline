@@ -35,8 +35,8 @@ pub enum Event {
     Error {
         message: String,
     },
-    /// The GPU had no memory left for the dictation, which is decoded again on the CPU; its
-    /// finals come again from its start.
+    /// The GPU had no memory left for the dictation, which is decoded again on the CPU once it
+    /// stops: one final then holds all of it.
     Fallback {
         reason: String,
     },

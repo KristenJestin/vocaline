@@ -115,16 +115,17 @@ The states:
 - A dictation the GPU had no memory for is not lost (since #38). The engine dies; the daemon
   publishes a `fallback` and stays `listening` until the dictation is stopped, the microphone
   still heard but nothing decoded. Once it stops, the whole dictation is decoded again on the
-  CPU, from its start: its `final` events come again under new `utterance` numbers, after the
-  `stopping`, and replace those the dictation had before the `fallback` (the paste, `last` and
-  the statistics hold only the CPU's). A reader that keeps the phrases of a dictation drops
-  them at the `fallback`. The decode takes longer on the CPU: `idle` comes later.
+  CPU as one recording: one `final` under a new `utterance` number, with no `partial`, after the
+  `stopping`, holds the text of all of it and replaces the phrases the dictation had before the
+  `fallback` (the paste, `last` and the statistics hold only that one). A reader that keeps the
+  phrases of a dictation drops them at the `fallback`. `idle` comes later than on the GPU: 1.6 s
+  after the stop for 17 s of dictation, 10 s for a minute, on an 8-core desktop CPU.
 
   ```json
   {"type":"final","utterance":4,"text":"Bonjour"}
   {"type":"fallback","reason":"ggml_backend_cuda_buffer_type_alloc_buffer: allocating 232.73 MiB on device 0: cudaMalloc failed: out of memory"}
   {"type":"state","state":"stopping"}
-  {"type":"final","utterance":5,"text":"Bonjour tout le monde."}
+  {"type":"final","utterance":5,"text":"Bonjour tout le monde, je voudrais tester la dictée."}
   {"type":"state","state":"idle"}
   ```
 - A reader that cannot keep up is disconnected rather than slowing the daemon down.
