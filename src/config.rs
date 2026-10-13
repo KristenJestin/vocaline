@@ -132,6 +132,10 @@ pub struct EngineConfig {
     pub language: String,
     /// How often the open utterance is decoded again (a partial).
     pub partial_ms: u32,
+    /// How often the open utterance is decoded again to show the partial text, apart from
+    /// `partial_ms`, which also sets how soon the end of a phrase is seen. Not set: crispasr
+    /// follows the step. 0: no partial text, only the finals.
+    pub partial_decode_ms: Option<u32>,
     /// The silence that ends a phrase (a final).
     pub final_silence_ms: u32,
 }
@@ -145,6 +149,7 @@ impl Default for EngineConfig {
             backend: Backend::Cuda,
             language: "fr".into(),
             partial_ms: 400,
+            partial_decode_ms: None,
             final_silence_ms: 700,
         }
     }
@@ -285,6 +290,36 @@ mod tests {
         assert_eq!(engine.language, "en");
         assert_eq!(engine.partial_ms, 800);
         assert_eq!(engine.final_silence_ms, 1000);
+    }
+
+    #[test]
+    fn the_partial_decode_cadence_is_not_set_by_default() {
+        let config = Config::parse("", &dirs()).unwrap();
+        assert_eq!(config.engine.partial_decode_ms, None);
+    }
+
+    #[test]
+    fn the_file_can_set_the_partial_decode_cadence_apart_from_the_step() {
+        let text = "[engine]\npartial_ms = 400\npartial_decode_ms = 1500";
+        let engine = Config::parse(text, &dirs()).unwrap().engine;
+        assert_eq!(engine.partial_ms, 400);
+        assert_eq!(engine.partial_decode_ms, Some(1500));
+    }
+
+    #[test]
+    fn a_partial_decode_cadence_of_zero_is_kept_as_zero() {
+        let text = "[engine]\npartial_decode_ms = 0";
+        let engine = Config::parse(text, &dirs()).unwrap().engine;
+        assert_eq!(engine.partial_decode_ms, Some(0));
+    }
+
+    #[test]
+    fn a_negative_or_not_a_number_partial_decode_cadence_is_an_error() {
+        for value in ["-1", "\"fast\"", "1.5", "true"] {
+            let text = format!("[engine]\npartial_decode_ms = {value}");
+            let error = Config::parse(&text, &dirs()).unwrap_err();
+            assert!(error.contains("partial_decode_ms"), "{value}: {error}");
+        }
     }
 
     #[test]

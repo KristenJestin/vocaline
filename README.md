@@ -48,7 +48,10 @@ partial_ms = 1500
 ```
 
 On the CPU it takes about half the CPU of the default and keeps up with a long phrase; the
-first grey text comes about a second later (1.7 s instead of 0.7 s). A `config.toml` that
+first grey text comes about a second later (1.7 s instead of 0.7 s). On a machine without a
+GPU, `partial_decode_ms` goes further: the grey text is decoded on its own cadence while the
+step stays short, so a phrase still ends as soon as the pause is heard. `0` decodes no grey text
+at all (the engine still emits about one just before each final). A `config.toml` that
 exists is never edited: if it does not set `backend`, setup prints the block for you to copy.
 
 The unit is bound to `graphical-session.target`, which Hyprland started through `uwsm`
@@ -85,7 +88,8 @@ model = "parakeet-tdt-0.6b-v3-q8_0.gguf"      # or canary-1b-v2-q8_0.gguf; relat
 vad_model = "ggml-silero-v6.2.0.bin"          # relative: read from the models folder; "auto": CrispASR fetches it
 backend = "cuda"                              # cuda, vulkan or cpu
 language = "fr"
-partial_ms = 400                              # the open phrase is decoded again this often
+partial_ms = 400                              # the engine's step: how often it listens, so how soon the end of a phrase is seen
+# partial_decode_ms = 1500                    # not set: the open phrase is decoded at every step; set, this often (0: no grey text, finals only)
 final_silence_ms = 700                        # this much silence ends a phrase
 
 [key]

@@ -25,6 +25,9 @@ const KEPT_DIAGNOSTICS: usize = 5;
 /// Bytes of them that go into the event: it reaches every watcher, and a log.
 const KEPT_BYTES: usize = 400;
 
+/// The partial decode interval that stands for "no partials": crispasr reads 0 as "every step".
+const NO_PARTIAL_MS: u32 = 600_000;
+
 pub struct CrispAsr {
     config: EngineConfig,
     /// The audio is decoded as one recording once it has all come, not as a stream.
@@ -90,6 +93,14 @@ impl CrispAsr {
                 "--stream-final-on-silence-ms",
                 &c.final_silence_ms.to_string(),
             ]);
+        // On the CPU the partial decodes are what costs, and the step also sets how soon the end
+        // of a phrase is seen, so the two are set apart. crispasr has no "off" value: 0 means
+        // "at every step", so no partials is an interval no dictation reaches (10 minutes). It
+        // still emits about one partial just before each final.
+        if let Some(ms) = c.partial_decode_ms {
+            let ms = if ms == 0 { NO_PARTIAL_MS } else { ms };
+            command.args(["--stream-partial-decode-ms", &ms.to_string()]);
+        }
         // The bundled OpenMP pool busy-waits on every core while the GPU decodes: 38 s of CPU
         // for 17 s of audio, against about 1 s with a single thread. On the CPU backend those
         // threads do the work, so they are left alone.
@@ -424,6 +435,73 @@ mod tests {
                 "{expected} missing from {joined}"
             );
         }
+    }
+
+    fn args_of(config: EngineConfig, whole: bool) -> Vec<String> {
+        let engine = CrispAsr { config, whole };
+        let command = engine.command();
+        command
+            .get_args()
+            .map(|a| a.to_str().unwrap().to_owned())
+            .collect()
+    }
+
+    fn value_of(args: &[String], flag: &str) -> Option<String> {
+        let at = args.iter().position(|a| a == flag)?;
+        args.get(at + 1).cloned()
+    }
+
+    #[test]
+    fn without_the_partial_decode_cadence_crispasr_keeps_its_own() {
+        let args = args_of(EngineConfig::default(), false);
+        assert!(
+            !args.iter().any(|a| a == "--stream-partial-decode-ms"),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn the_partial_decode_cadence_is_passed_to_the_stream_as_it_is() {
+        let config = EngineConfig {
+            partial_ms: 400,
+            partial_decode_ms: Some(1500),
+            ..EngineConfig::default()
+        };
+        let args = args_of(config, false);
+        assert_eq!(
+            value_of(&args, "--stream-partial-decode-ms").as_deref(),
+            Some("1500")
+        );
+        assert_eq!(value_of(&args, "--stream-step").as_deref(), Some("400"));
+    }
+
+    // crispasr reads 0 as "decode at every step", so no partials is a very large interval.
+    #[test]
+    fn a_partial_decode_cadence_of_zero_is_a_very_large_interval() {
+        let config = EngineConfig {
+            partial_decode_ms: Some(0),
+            ..EngineConfig::default()
+        };
+        let args = args_of(config, false);
+        assert_eq!(
+            value_of(&args, "--stream-partial-decode-ms").as_deref(),
+            Some("600000")
+        );
+    }
+
+    #[test]
+    fn the_cpu_fallback_takes_no_partial_decode_cadence() {
+        let config = EngineConfig {
+            partial_decode_ms: Some(1500),
+            ..EngineConfig::default()
+        };
+        let args = args_of(config.clone(), true);
+        assert!(
+            !args.iter().any(|a| a.starts_with("--stream")),
+            "the whole recording is not a stream: {args:?}"
+        );
+        let twin = CrispAsr::new(config).cpu_twin().command();
+        assert!(!twin.get_args().any(|a| a == "--stream-partial-decode-ms"));
     }
 
     // Parakeet ignores `-l fr` and wrote `Hello` for `allô`; Canary obeys it. Choosing the
