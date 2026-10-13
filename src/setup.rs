@@ -2,7 +2,7 @@
 //! package carries none of them. Only files Vocaline knows are fetched: their size and checksum
 //! are written here, so a truncated or replaced file is refused instead of loaded.
 
-use crate::config::EngineConfig;
+use crate::config::{Config, Dirs, EngineConfig};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -74,6 +74,83 @@ impl Fetch for Curl {
             Err(format!("curl could not download {url} ({status})"))
         }
     }
+}
+
+/// What tells whether the engine can use an NVIDIA GPU; behind a trait so the tests choose.
+pub trait Gpu {
+    fn usable(&self) -> bool;
+}
+
+/// The block measured in #8 for a machine without a GPU.
+pub const CPU_BLOCK: &str = "[engine]\n\
+model = \"parakeet-tdt-0.6b-v3-q4_k.gguf\"\n\
+backend = \"cpu\"\n\
+partial_ms = 1500\n";
+
+/// `nvidia-smi -L`: it lists the cards the driver sees, and loads nothing on them. A missing
+/// binary, a driver that is not loaded or a machine without a card all end in "not usable".
+pub struct NvidiaSmi;
+
+impl Gpu for NvidiaSmi {
+    fn usable(&self) -> bool {
+        Command::new("nvidia-smi")
+            .arg("-L")
+            .stderr(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|o| o.status.success() && lists_a_gpu(&String::from_utf8_lossy(&o.stdout)))
+    }
+}
+
+fn lists_a_gpu(listing: &str) -> bool {
+    listing.lines().any(|line| line.starts_with("GPU "))
+}
+
+/// Loads the configuration, after setting the CPU up when there is no GPU: a new machine gets
+/// the block written, a configuration that exists is never edited, only shown the block.
+pub fn configure(dirs: &Dirs, gpu: &dyn Gpu, out: &mut impl Write) -> Result<Config, String> {
+    let path = dirs.config_file();
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    if gpu.usable() {
+        return Config::load(dirs);
+    }
+    let shown = |e: std::io::Error| e.to_string();
+    match existing {
+        None => {
+            std::fs::create_dir_all(&dirs.config)
+                .and_then(|()| std::fs::write(&path, CPU_BLOCK))
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            writeln!(
+                out,
+                "no NVIDIA GPU found: wrote {} for the CPU (q4_k model, 1.5 s between partials)",
+                path.display()
+            )
+            .map_err(shown)?;
+        }
+        Some(text) => {
+            // A broken file is reported by `load`, as it is without this step.
+            let config = Config::load(dirs)?;
+            if !sets_backend(&text) {
+                writeln!(
+                    out,
+                    "no NVIDIA GPU found and {} does not set `backend`: to run on the CPU, put \
+                     this in it:\n\n{CPU_BLOCK}",
+                    path.display()
+                )
+                .map_err(shown)?;
+            }
+            return Ok(config);
+        }
+    }
+    Config::load(dirs)
+}
+
+fn sets_backend(text: &str) -> bool {
+    text.parse::<toml::Table>()
+        .is_ok_and(|t| t.get("engine").and_then(|e| e.get("backend")).is_some())
 }
 
 /// The files the engine needs: the model, and the VAD model unless CrispASR fetches it itself.
@@ -190,6 +267,7 @@ fn size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Backend;
     use std::cell::RefCell;
 
     /// A network that serves `body` for every URL and remembers what it was asked.
@@ -312,5 +390,108 @@ mod tests {
             let known = CATALOGUE.iter().find(|k| k.name == name);
             assert!(known.is_some_and(|k| k.url.ends_with(name)), "{name}");
         }
+    }
+
+    struct FakeGpu(bool);
+
+    impl Gpu for FakeGpu {
+        fn usable(&self) -> bool {
+            self.0
+        }
+    }
+
+    fn dirs_in(name: &str) -> Dirs {
+        let root = folder(name);
+        Dirs {
+            config: root.join("config/vocaline"),
+            data: root.join("data/vocaline"),
+            runtime: root.join("run"),
+        }
+    }
+
+    fn written(dirs: &Dirs) -> Option<String> {
+        std::fs::read_to_string(dirs.config_file()).ok()
+    }
+
+    #[test]
+    fn no_gpu_and_no_config_writes_the_cpu_block_and_wants_the_q4_k_model() {
+        let dirs = dirs_in("nogpu-new");
+        let mut out = Vec::new();
+        let config = configure(&dirs, &FakeGpu(false), &mut out).unwrap();
+        assert_eq!(written(&dirs).as_deref(), Some(CPU_BLOCK));
+        assert_eq!(config.engine.backend, Backend::Cpu);
+        assert_eq!(config.engine.partial_ms, 1500);
+        let models = dirs.data.join("models");
+        assert_eq!(
+            wanted(&config.engine),
+            [
+                models.join("parakeet-tdt-0.6b-v3-q4_k.gguf"),
+                models.join("ggml-silero-v6.2.0.bin")
+            ]
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(
+            out.contains(&dirs.config_file().display().to_string()),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn no_gpu_and_an_existing_config_leaves_it_byte_for_byte_and_prints_the_block() {
+        let dirs = dirs_in("nogpu-existing");
+        std::fs::create_dir_all(&dirs.config).unwrap();
+        let mine = "# mine\n[engine]\nlanguage = \"en\"\n\n[key]\nhold_ms = 400";
+        std::fs::write(dirs.config_file(), mine).unwrap();
+        let mut out = Vec::new();
+        let config = configure(&dirs, &FakeGpu(false), &mut out).unwrap();
+        assert_eq!(written(&dirs).as_deref(), Some(mine));
+        assert_eq!(config.engine.backend, Backend::Cuda);
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains(CPU_BLOCK), "{out}");
+        assert!(out.contains("no NVIDIA GPU"), "{out}");
+    }
+
+    #[test]
+    fn no_gpu_and_a_config_that_sets_the_backend_is_left_alone_in_silence() {
+        let dirs = dirs_in("nogpu-backend");
+        std::fs::create_dir_all(&dirs.config).unwrap();
+        let mine = "[engine]\nbackend = \"vulkan\"\n";
+        std::fs::write(dirs.config_file(), mine).unwrap();
+        let mut out = Vec::new();
+        let config = configure(&dirs, &FakeGpu(false), &mut out).unwrap();
+        assert_eq!(written(&dirs).as_deref(), Some(mine));
+        assert_eq!(config.engine.backend, Backend::Vulkan);
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    }
+
+    #[test]
+    fn a_gpu_changes_nothing() {
+        let dirs = dirs_in("gpu");
+        let mut out = Vec::new();
+        let config = configure(&dirs, &FakeGpu(true), &mut out).unwrap();
+        assert_eq!(written(&dirs), None);
+        assert_eq!(config, Config::load(&dirs).unwrap());
+        assert_eq!(config.engine.backend, Backend::Cuda);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_broken_config_is_still_an_error_without_a_gpu() {
+        let dirs = dirs_in("nogpu-broken");
+        std::fs::create_dir_all(&dirs.config).unwrap();
+        std::fs::write(dirs.config_file(), "[engine\n").unwrap();
+        let error = configure(&dirs, &FakeGpu(false), &mut Vec::new()).unwrap_err();
+        assert!(error.contains("config.toml"), "{error}");
+        assert_eq!(written(&dirs).as_deref(), Some("[engine\n"));
+    }
+
+    #[test]
+    fn nvidia_smi_lists_a_gpu_or_it_does_not() {
+        assert!(lists_a_gpu(
+            "GPU 0: NVIDIA GeForce RTX 3060 (UUID: GPU-1234)\n"
+        ));
+        assert!(!lists_a_gpu(""));
+        assert!(!lists_a_gpu("No devices were found\n"));
     }
 }

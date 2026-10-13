@@ -77,12 +77,13 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Cli::Watch => cli::watch(&dirs.socket(), &mut std::io::stdout().lock())?,
         Cli::Setup => {
-            let config = Config::load(&dirs)?;
+            let mut out = std::io::stdout().lock();
+            let config = setup::configure(&dirs, &setup::NvidiaSmi, &mut out)?;
             setup::setup(
                 &setup::wanted(&config.engine),
                 setup::CATALOGUE,
                 &setup::Curl,
-                &mut std::io::stdout().lock(),
+                &mut out,
             )?;
         }
     }
