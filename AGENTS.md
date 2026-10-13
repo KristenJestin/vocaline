@@ -131,7 +131,8 @@ git config core.hooksPath .githooks     # once per clone: the commit-msg and pre
 - Scopes: `engine`, `audio`, `daemon`, `events`, `cli`, `output`, `vocabulary`, `rules`,
   `stats`, `config`, `repo`, `ci`.
 - **Pull requests are merged by squash only.** The title is a plain Angular subject. The
-  description is written in the first person as the maintainer and ends with `Closes #<n>`.
+  squash appends ` (#<n>)`, and that suffix counts in the 72 characters: the title is checked
+  with it. The description is written in the first person as the maintainer and ends with `Closes #<n>`.
 
 ## Security and privacy
 
