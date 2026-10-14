@@ -132,8 +132,16 @@ pub struct EngineConfig {
     pub language: String,
     /// How often the open utterance is decoded again (a partial).
     pub partial_ms: u32,
+    /// How often the open utterance is decoded again to show the partial text, apart from
+    /// `partial_ms`, which also sets how soon the end of a phrase is seen. Not set: crispasr
+    /// follows the step. 0: no partial text, only the finals.
+    pub partial_decode_ms: Option<u32>,
     /// The silence that ends a phrase (a final).
     pub final_silence_ms: u32,
+    /// A phrase under 2 s is decoded again with up to this many seconds of the audio before
+    /// it, so a short French phrase is not heard as English. It needs the patched crispasr of
+    /// the package; 0 passes nothing, for an upstream crispasr, which does not know the option.
+    pub short_context_sec: u32,
 }
 
 impl Default for EngineConfig {
@@ -145,7 +153,9 @@ impl Default for EngineConfig {
             backend: Backend::Cuda,
             language: "fr".into(),
             partial_ms: 400,
+            partial_decode_ms: None,
             final_silence_ms: 700,
+            short_context_sec: 10,
         }
     }
 }
@@ -285,6 +295,63 @@ mod tests {
         assert_eq!(engine.language, "en");
         assert_eq!(engine.partial_ms, 800);
         assert_eq!(engine.final_silence_ms, 1000);
+    }
+
+    #[test]
+    fn the_partial_decode_cadence_is_not_set_by_default() {
+        let config = Config::parse("", &dirs()).unwrap();
+        assert_eq!(config.engine.partial_decode_ms, None);
+    }
+
+    #[test]
+    fn the_file_can_set_the_partial_decode_cadence_apart_from_the_step() {
+        let text = "[engine]\npartial_ms = 400\npartial_decode_ms = 1500";
+        let engine = Config::parse(text, &dirs()).unwrap().engine;
+        assert_eq!(engine.partial_ms, 400);
+        assert_eq!(engine.partial_decode_ms, Some(1500));
+    }
+
+    #[test]
+    fn a_partial_decode_cadence_of_zero_is_kept_as_zero() {
+        let text = "[engine]\npartial_decode_ms = 0";
+        let engine = Config::parse(text, &dirs()).unwrap().engine;
+        assert_eq!(engine.partial_decode_ms, Some(0));
+    }
+
+    #[test]
+    fn a_negative_or_not_a_number_partial_decode_cadence_is_an_error() {
+        for value in ["-1", "\"fast\"", "1.5", "true"] {
+            let text = format!("[engine]\npartial_decode_ms = {value}");
+            let error = Config::parse(&text, &dirs()).unwrap_err();
+            assert!(error.contains("partial_decode_ms"), "{value}: {error}");
+        }
+    }
+
+    #[test]
+    fn short_finals_get_10_s_of_context_by_default() {
+        let config = Config::parse("", &dirs()).unwrap();
+        assert_eq!(config.engine.short_context_sec, 10);
+    }
+
+    #[test]
+    fn the_file_can_change_the_short_context_or_turn_it_off() {
+        let engine = Config::parse("[engine]\nshort_context_sec = 4", &dirs())
+            .unwrap()
+            .engine;
+        assert_eq!(engine.short_context_sec, 4);
+        let engine = Config::parse("[engine]\nshort_context_sec = 0", &dirs())
+            .unwrap()
+            .engine;
+        assert_eq!(engine.short_context_sec, 0);
+    }
+
+    #[test]
+    fn a_negative_or_not_a_number_short_context_is_an_error() {
+        for value in ["-1", "\"long\"", "1.5", "true"] {
+            let text = format!("[engine]\nshort_context_sec = {value}");
+            let error = Config::parse(&text, &dirs()).unwrap_err();
+            assert!(error.contains("short_context_sec"), "{value}: {error}");
+        }
     }
 
     #[test]

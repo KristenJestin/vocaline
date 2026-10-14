@@ -69,7 +69,10 @@ pub trait Desktop: Send + Sync {
 
 pub trait Clipboard: Send + Sync {
     fn save(&self) -> io::Result<Contents>;
-    fn set_text(&self, text: &str) -> io::Result<()>;
+    /// Offers the text, and returns once the compositor holds it: the focused application then
+    /// sees it before any key typed afterwards. Each read of it is told, once served, by when
+    /// it was asked.
+    fn set_text(&self, text: &str) -> io::Result<mpsc::Receiver<Instant>>;
     fn restore(&self, contents: Contents) -> io::Result<()>;
 }
 
@@ -98,6 +101,12 @@ pub struct Timing {
     /// How long the application is given to read the clipboard after the shortcut: it reads
     /// it afterwards, on its own time, so changing the clipboard sooner pastes the wrong text.
     pub settle: Duration,
+    /// How long a busy application is waited for when it has not read the phrase within the
+    /// settle: past it, the shortcut is taken as lost and the clipboard comes back.
+    pub unread: Duration,
+    /// How long no read of a new phrase is waited for before the shortcut: a clipboard history
+    /// reads each new selection at once, and its reads must not be taken for the application's.
+    pub quiet: Duration,
 }
 
 impl Default for Timing {
@@ -105,6 +114,8 @@ impl Default for Timing {
         Timing {
             poll: Duration::from_millis(20),
             settle: Duration::from_millis(400),
+            unread: Duration::from_secs(2),
+            quiet: Duration::from_millis(15),
         }
     }
 }
@@ -130,7 +141,7 @@ impl Output {
             target: None,
             first: true,
             saved: None,
-            pasted_at: None,
+            last: None,
         };
         thread::spawn(move || worker.run(queue));
         Output { desktop, jobs }
@@ -168,20 +179,43 @@ struct Worker {
     first: bool,
     /// The user's clipboard, while ours holds a phrase.
     saved: Option<Contents>,
-    pasted_at: Option<Instant>,
+    last: Option<Pasted>,
+}
+
+/// The last phrase pasted, which the application may not have read yet.
+struct Pasted {
+    /// When the shortcut was pressed: a read asked sooner is a clipboard history's, not the
+    /// application's.
+    at: Instant,
+    reads: mpsc::Receiver<Instant>,
+    read: bool,
+}
+
+impl Pasted {
+    fn read(&mut self) -> bool {
+        if !self.read {
+            let at = self.at;
+            self.read = self.reads.try_iter().any(|asked| asked >= at);
+        }
+        self.read
+    }
 }
 
 impl Worker {
     fn run(mut self, queue: mpsc::Receiver<Job>) {
         loop {
-            // The user's clipboard comes back once no phrase follows the last one in time.
+            // The user's clipboard comes back once the application has read the last phrase and
+            // no phrase follows it in time.
             let job = if self.saved.is_some() {
-                match queue.recv_timeout(self.timing.settle) {
+                let until = self.until_restore();
+                if until.is_zero() {
+                    self.restore();
+                    continue;
+                }
+                // The reads do not come on this queue: they are looked at again every poll.
+                match queue.recv_timeout(until.min(self.timing.poll)) {
                     Ok(job) => job,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        self.restore();
-                        continue;
-                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(mpsc::RecvTimeoutError::Disconnected) => return self.restore(),
                 }
             } else {
@@ -235,12 +269,16 @@ impl Worker {
             self.saved = Some(self.ports.clipboard.save()?);
         }
         let class = self.focus_target();
-        if let Some(at) = self.pasted_at {
-            thread::sleep(self.timing.settle.saturating_sub(at.elapsed()));
-        }
-        self.ports.clipboard.set_text(text)?;
+        self.wait_for_read();
+        let reads = self.ports.clipboard.set_text(text)?;
+        while reads.recv_timeout(self.timing.quiet).is_ok() {}
+        let at = Instant::now();
         self.ports.keyboard.press(shortcut_for(&class))?;
-        self.pasted_at = Some(Instant::now());
+        self.last = Some(Pasted {
+            at,
+            reads,
+            read: false,
+        });
         Ok(())
     }
 
@@ -249,10 +287,35 @@ impl Worker {
         self.focus_target();
         // Enter sooner than the application's read of the clipboard would run the line before
         // the text is in it.
-        if let Some(at) = self.pasted_at {
-            thread::sleep(self.timing.settle.saturating_sub(at.elapsed()));
-        }
+        self.wait_for_read();
         self.ports.keyboard.press(Shortcut::Enter)
+    }
+
+    /// Waits until the application has read the last phrase, and the settle after its
+    /// shortcut: a busy one reads it late, so changing the clipboard after a fixed time pastes
+    /// the wrong text. One that has not read it within `unread` never will.
+    fn wait_for_read(&mut self) {
+        let Some(last) = &mut self.last else {
+            return;
+        };
+        while !last.read() && last.at.elapsed() < self.timing.unread {
+            thread::sleep(self.timing.poll);
+        }
+        thread::sleep(self.timing.settle.saturating_sub(last.at.elapsed()));
+    }
+
+    /// How long until the user's clipboard may come back: the settle after the shortcut once
+    /// the application has read the phrase, `unread` after it while it has not.
+    fn until_restore(&mut self) -> Duration {
+        let Some(last) = &mut self.last else {
+            return Duration::ZERO;
+        };
+        let after = if last.read() {
+            self.timing.settle
+        } else {
+            self.timing.unread
+        };
+        after.saturating_sub(last.at.elapsed())
     }
 
     /// Gives the focus back to the window of the dictation, and returns the class of the
@@ -417,14 +480,8 @@ impl Clipboard for Wayland {
         Ok(contents)
     }
 
-    fn set_text(&self, text: &str) -> io::Result<()> {
-        use wl_clipboard_rs::copy::{MimeType, Options, Source};
-        let mut options = Options::new();
-        // A clipboard history that honours the hint keeps no copy of what was dictated.
-        options.sensitive(true);
-        options
-            .copy(Source::Bytes(text.as_bytes().into()), MimeType::Text)
-            .map_err(io::Error::other)
+    fn set_text(&self, text: &str) -> io::Result<mpsc::Receiver<Instant>> {
+        selection::offer(text)
     }
 
     fn restore(&self, contents: Contents) -> io::Result<()> {
@@ -444,6 +501,8 @@ impl Clipboard for Wayland {
         options.copy_multi(sources).map_err(io::Error::other)
     }
 }
+
+mod selection;
 
 #[cfg(test)]
 mod tests;

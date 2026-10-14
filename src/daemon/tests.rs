@@ -2882,12 +2882,13 @@ fn a_gpu_memory_failure_after_the_stop_is_decoded_again_too() {
     let watcher = Watcher::on(&daemon);
     daemon.command(Command::Start).unwrap();
     watcher.skip_to(&state(State::Listening));
-    daemon.command(Command::Stop).unwrap();
-    watcher.skip_to(&state(State::Stopping));
-    // crispasr dies after it has read the end of the audio: the audio is all in by then.
+    // The stop must come after some audio: a stop sent before the first chunk leaves the engine with none.
     wait_until("the engine has the audio", || {
         gpu.heard.load(Ordering::SeqCst) > 0
     });
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Stopping));
+    // crispasr dies after it has read the end of the audio: the audio is all in by then.
     thread::sleep(Duration::from_millis(100));
     gpu.emit(EngineEvent::Ended(Err(Failure::GpuMemory(GPU_FULL.into()))));
     watcher.expect(&[
