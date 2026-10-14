@@ -85,7 +85,7 @@ prepare() {
   cargo fetch --locked --manifest-path "$_root/Cargo.toml" --target "$(rustc -vV | sed -n 's/^host: //p')"
 }
 
-build() {
+_build_crispasr() {
   # The prebuilt CUDA 13 bundle's setup: the ggml backends are loaded at run time, so the same
   # binary runs on the CPU where CUDA is missing, with a CPU variant per generation (x64 to
   # Sapphire Rapids and Zen 4). CUDA from Turing (sm_75) to Blackwell (sm_120), plus PTX for
@@ -111,6 +111,18 @@ build() {
     -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
     -DFETCHCONTENT_SOURCE_DIR_CATCH2="$srcdir/catch2"
   cmake --build "$srcdir/crispasr-build" --target crispasr-cli test-stream-finalize
+}
+
+build() {
+  # Compiling CrispASR's CUDA kernels takes hours: CI keeps the bin/ it built, keyed on what
+  # it is built from (.github/workflows/package.yml), and hands it back here when none of that
+  # changed. A local makepkg always builds it.
+  if [[ -n ${VOCALINE_CRISPASR_BUILT:-} ]]; then
+    mkdir -p "$srcdir/crispasr-build"
+    cp -a "$VOCALINE_CRISPASR_BUILT" "$srcdir/crispasr-build/bin"
+  else
+    _build_crispasr
+  fi
 
   export CARGO_TARGET_DIR="$srcdir/target"
   export VOCALINE_ENGINE=/usr/lib/vocaline/crispasr/crispasr

@@ -25,38 +25,60 @@ jobs:
         working-directory: packaging/arch
         run: |
           pacman -S --noconfirm --needed $(source ./PKGBUILD && echo "${depends[@]}" "${makedepends[@]}")
-      # Compiling CrispASR's CUDA kernels is most of the build: ggml uses ccache when it is
-      # there, so its cache is kept from one run to the next. The key names the CrispASR
-      # version, the patch and the build() of the PKGBUILD; a run that changes one of them
-      # starts from the closest cache and only compiles again what changed.
-      - name: Name the compiler cache
-        id: ccache-key
+      # Compiling CrispASR's CUDA kernels is most of the build: three hours on a runner. What
+      # it builds is kept from one run to the next, keyed on all it is built from: the CrispASR
+      # version and pins, the patch, how the PKGBUILD prepares and builds it, and the CUDA it is
+      # compiled with. A run that changes none of them, nearly every one, skips that build.
+      - name: Name the caches
+        id: keys
         working-directory: packaging/arch
         run: |
           version=$(source ./PKGBUILD && echo "$_crispasr")
-          inputs=$(cat crispasr-short-context.patch <(sed -n '/^build() {/,/^}/p' PKGBUILD) | sha256sum | cut -c1-16)
-          echo "prefix=crispasr-$version-" >> "$GITHUB_OUTPUT"
-          echo "key=crispasr-$version-$inputs" >> "$GITHUB_OUTPUT"
+          inputs=$(cat crispasr-short-context.patch \
+            <(grep -E '^_(crispasr|ggml|c2pa_audio|catch2)=' PKGBUILD) \
+            <(sed -n '/^prepare() {/,/^}/p;/^_build_crispasr() {/,/^}/p' PKGBUILD) \
+            <(pacman -Q cuda) | sha256sum | cut -c1-16)
+          echo "engine=crispasr-engine-$version-$inputs" >> "$GITHUB_OUTPUT"
+          echo "ccache-prefix=crispasr-$version-" >> "$GITHUB_OUTPUT"
+          echo "ccache=crispasr-$version-$inputs" >> "$GITHUB_OUTPUT"
       - uses: actions/cache/restore@v4
+        id: engine
+        with:
+          path: /crispasr-built
+          key: ${{ steps.keys.outputs.engine }}
+      # When it must be built again, ggml uses ccache, whose cache is kept too: a change of the
+      # patch then only compiles again what it touches.
+      - uses: actions/cache/restore@v4
+        if: steps.engine.outputs.cache-hit != 'true'
         with:
           path: /ccache
-          key: ${{ steps.ccache-key.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ steps.keys.outputs.ccache }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            ${{ steps.ccache-key.outputs.key }}-
-            ${{ steps.ccache-key.outputs.prefix }}
+            ${{ steps.keys.outputs.ccache }}-
+            ${{ steps.keys.outputs.ccache-prefix }}
       # makepkg refuses to run as root.
       - name: Build the package
+        env:
+          VOCALINE_CRISPASR_BUILT: ${{ steps.engine.outputs.cache-hit == 'true' && '/crispasr-built' || '' }}
         run: |
           useradd --create-home builder
           mkdir -p /ccache
           chown -R builder "$GITHUB_WORKSPACE" /ccache
-          su builder -c "export CCACHE_DIR=/ccache CCACHE_MAXSIZE=3G && ccache -z && git config --global --add safe.directory '$GITHUB_WORKSPACE' && cd '$GITHUB_WORKSPACE/packaging/arch' && makepkg --noconfirm; status=\$?; ccache -s; exit \$status"
+          su builder -c "export CCACHE_DIR=/ccache CCACHE_MAXSIZE=3G VOCALINE_CRISPASR_BUILT='$VOCALINE_CRISPASR_BUILT' && ccache -z && git config --global --add safe.directory '$GITHUB_WORKSPACE' && cd '$GITHUB_WORKSPACE/packaging/arch' && makepkg --noconfirm; status=\$?; ccache -s; exit \$status"
       # Saved even when the build fails, so the next attempt does not compile it all again.
       - uses: actions/cache/save@v4
-        if: always()
+        if: always() && steps.engine.outputs.cache-hit != 'true'
         with:
           path: /ccache
-          key: ${{ steps.ccache-key.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ steps.keys.outputs.ccache }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Keep the engine built
+        if: steps.engine.outputs.cache-hit != 'true'
+        run: cp -a packaging/arch/src/crispasr-build/bin /crispasr-built
+      - uses: actions/cache/save@v4
+        if: steps.engine.outputs.cache-hit != 'true'
+        with:
+          path: /crispasr-built
+          key: ${{ steps.keys.outputs.engine }}
       - name: Check the package
         working-directory: packaging/arch
         run: |
