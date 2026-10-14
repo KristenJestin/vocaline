@@ -14,8 +14,20 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    # The CUDA build does not fit in the disk the runner leaves free: what the runner's host
+    # holds and this job does not use (Android, .NET, the tool cache) is mounted to be removed.
+    container:
+      image: archlinux:base-devel
+      volumes:
+        - /usr/local/lib/android:/host/android
+        - /usr/share/dotnet:/host/dotnet
+        - /opt/hostedtoolcache:/host/toolcache
     steps:
+      - name: Make room on the runner
+        run: |
+          df -h /
+          rm -rf /host/android/* /host/dotnet/* /host/toolcache/*
+          df -h /
       # git first: without it the checkout has no history, and the version counts commits.
       - run: pacman -Syu --noconfirm --needed git namcap ccache
       - uses: actions/checkout@v4
@@ -67,7 +79,7 @@ jobs:
           su builder -c "export CCACHE_DIR=/ccache CCACHE_MAXSIZE=3G VOCALINE_CRISPASR_BUILT='$VOCALINE_CRISPASR_BUILT' && ccache -z && git config --global --add safe.directory '$GITHUB_WORKSPACE' && cd '$GITHUB_WORKSPACE/packaging/arch' && makepkg --noconfirm; status=\$?; ccache -s; exit \$status"
       # The build leaves the runner's disk full: the caches and namcap need the room its trees
       # take. Only the engine's bin/ is kept, to be cached.
-      - name: Make room
+      - name: Free the build trees
         if: always()
         working-directory: packaging/arch
         run: |
