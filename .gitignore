@@ -1,3 +1,4 @@
 /target
 /packaging/arch/*
 !/packaging/arch/PKGBUILD
+!/packaging/arch/crispasr-short-context.patch

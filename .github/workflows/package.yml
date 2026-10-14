@@ -14,10 +14,22 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    # The CUDA build does not fit in the disk the runner leaves free: what the runner's host
+    # holds and this job does not use (Android, .NET, the tool cache) is mounted to be removed.
+    container:
+      image: archlinux:base-devel
+      volumes:
+        - /usr/local/lib/android:/host/android
+        - /usr/share/dotnet:/host/dotnet
+        - /opt/hostedtoolcache:/host/toolcache
     steps:
+      - name: Make room on the runner
+        run: |
+          df -h /
+          rm -rf /host/android/* /host/dotnet/* /host/toolcache/*
+          df -h /
       # git first: without it the checkout has no history, and the version counts commits.
-      - run: pacman -Syu --noconfirm --needed git namcap
+      - run: pacman -Syu --noconfirm --needed git namcap ccache
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -25,12 +37,68 @@ jobs:
         working-directory: packaging/arch
         run: |
           pacman -S --noconfirm --needed $(source ./PKGBUILD && echo "${depends[@]}" "${makedepends[@]}")
+      # Compiling CrispASR's CUDA kernels is most of the build: three hours on a runner. What
+      # it builds is kept from one run to the next, keyed on all it is built from: the CrispASR
+      # version and pins, the patch, how the PKGBUILD prepares and builds it, and the CUDA it is
+      # compiled with. A run that changes none of them, nearly every one, skips that build.
+      - name: Name the caches
+        id: keys
+        working-directory: packaging/arch
+        run: |
+          version=$(source ./PKGBUILD && echo "$_crispasr")
+          inputs=$(cat crispasr-short-context.patch \
+            <(grep -E '^_(crispasr|ggml|c2pa_audio|catch2)=' PKGBUILD) \
+            <(sed -n '/^prepare() {/,/^}/p;/^_build_crispasr() {/,/^}/p' PKGBUILD) \
+            <(pacman -Q cuda) | sha256sum | cut -c1-16)
+          echo "engine=crispasr-engine-$version-$inputs" >> "$GITHUB_OUTPUT"
+          echo "ccache-prefix=crispasr-$version-" >> "$GITHUB_OUTPUT"
+          echo "ccache=crispasr-$version-$inputs" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: engine
+        with:
+          path: /crispasr-built
+          key: ${{ steps.keys.outputs.engine }}
+      # When it must be built again, ggml uses ccache, whose cache is kept too: a change of the
+      # patch then only compiles again what it touches.
+      - uses: actions/cache/restore@v4
+        if: steps.engine.outputs.cache-hit != 'true'
+        with:
+          path: /ccache
+          key: ${{ steps.keys.outputs.ccache }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ steps.keys.outputs.ccache }}-
+            ${{ steps.keys.outputs.ccache-prefix }}
       # makepkg refuses to run as root.
       - name: Build the package
+        env:
+          VOCALINE_CRISPASR_BUILT: ${{ steps.engine.outputs.cache-hit == 'true' && '/crispasr-built' || '' }}
         run: |
           useradd --create-home builder
-          chown -R builder "$GITHUB_WORKSPACE"
-          su builder -c "git config --global --add safe.directory '$GITHUB_WORKSPACE' && cd '$GITHUB_WORKSPACE/packaging/arch' && makepkg --noconfirm"
+          mkdir -p /ccache
+          chown -R builder "$GITHUB_WORKSPACE" /ccache
+          su builder -c "export CCACHE_DIR=/ccache CCACHE_MAXSIZE=3G VOCALINE_CRISPASR_BUILT='$VOCALINE_CRISPASR_BUILT' && ccache -z && git config --global --add safe.directory '$GITHUB_WORKSPACE' && cd '$GITHUB_WORKSPACE/packaging/arch' && makepkg --noconfirm; status=\$?; ccache -s; exit \$status"
+      # The build leaves the runner's disk full: the caches and namcap need the room its trees
+      # take. Only the engine's bin/ is kept, to be cached.
+      - name: Free the build trees
+        if: always()
+        working-directory: packaging/arch
+        run: |
+          if [ ! -e /crispasr-built ] && [ -d src/crispasr-build/bin ]; then
+            mv src/crispasr-build/bin /crispasr-built
+          fi
+          rm -rf src pkg
+          df -h / "$GITHUB_WORKSPACE"
+      # Saved even when the build fails, so the next attempt does not compile it all again.
+      - uses: actions/cache/save@v4
+        if: always() && steps.engine.outputs.cache-hit != 'true'
+        with:
+          path: /ccache
+          key: ${{ steps.keys.outputs.ccache }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/cache/save@v4
+        if: steps.engine.outputs.cache-hit != 'true'
+        with:
+          path: /crispasr-built
+          key: ${{ steps.keys.outputs.engine }}
       - name: Check the package
         working-directory: packaging/arch
         run: |

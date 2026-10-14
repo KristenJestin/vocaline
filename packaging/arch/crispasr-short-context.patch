@@ -1,0 +1,389 @@
+Vocaline's patch to CrispASR v0.8.42 (MIT, Copyright (c) the CrispASR authors; see its
+LICENSE, installed beside this package's licence). Not part of upstream CrispASR.
+
+Add --stream-short-context-sec N (default 0, off). In stream mode, an utterance shorter
+than the 2 s redecode minimum is never decoded again: its final is the stitched partial
+of its VAD slice alone, often too little audio for a multilingual model to settle on the
+language (a short French phrase comes back in English). With N > 0, such an utterance is
+decoded again with up to N s of the audio before it, starting no earlier than the
+previous utterance and the rolling window, and only the tokens stamped after the middle
+of the silence between the two, and none from more than 1 s before the utterance, are
+kept. Without a previous utterance in the window, under 2 s combined, or without token
+timestamps, the stitched fallback is used as before. With N = 0 the output is unchanged.
+
+The range and the token cut are pure helpers in crispasr_stream_finalize.h, covered by
+tests/test-stream-finalize.cpp.
+
+diff --git i/docs/streaming.md w/docs/streaming.md
+index ff3c82f..f90ad00 100755
+--- i/docs/streaming.md
++++ w/docs/streaming.md
+@@ -199,6 +199,22 @@ seen in `partial` events, never an empty string blanking a
+ previously-emitted partial. The fallback is internal; no flag, no
+ event change.
+ 
++`--stream-short-context-sec N` (default `0`, off) replaces that fallback
++with a real decode when there is context to give it. Under a second of
++speech is often too little for a multilingual model to settle on the
++language: Parakeet TDT v3 can hear a lone French `Allô ?` or `Non.` as
++English. With the option on, the short utterance is decoded once more
++together with up to N s of the audio before it, starting no earlier than
++the previous utterance and no earlier than the rolling window
++(`--stream-length`), and only the tokens stamped after the middle of the
++silence between the two utterances are kept (and none from more than 1 s
++before the utterance's VAD start, so a word the VAD missed in a long gap
++does not leak in). The stitched fallback is
++still used when there is no previous utterance, when the window no longer
++holds any of its speech, when the combined range is still under 2 s, or
++when the backend returns no token timestamps. Utterances of 2 s or more
++are not affected.
++
+ ### Streaming punctuation (`--stream-punc`)
+ 
+ When `--stream-json --vad` is combined with `--punc-model`, FireRedPunc
+@@ -676,6 +692,7 @@ block.
+ | `--stream-keep N` | `200` ms | Legacy — kept for compatibility, currently a no-op. The rolling buffer above subsumes it (see issue #84). |
+ | `--stream-partial-decode-ms N` | `0` ms | JSON+VAD only. Minimum interval between live partial ASR decodes. `0` preserves the previous behavior and decodes every `--stream-step`; larger values keep VAD/final timing at `--stream-step` while reducing partial ASR cadence. |
+ | `--stream-partial-tail-sec N` | `0` (off) | JSON+VAD only (#404). Cap each live partial decode to the last ~N seconds of the open utterance. Text decoded ahead of the moving anchor is kept as a committed prefix, so `partial.text` still covers the whole utterance, and `final.text` is untouched (redecode mode re-decodes the full utterance regardless). Cuts land on the quietest 100 ms, the same boundary policy as the long-audio chunker. Effective floor ~4 s. |
++| `--stream-short-context-sec N` | `0` (off) | JSON+VAD, `redecode` mode only. Decode a final shorter than 2 s again with up to N s of the audio before it (from the previous utterance) and keep only its own tokens, so a short phrase gets enough audio to settle its language. See *Short-utterance fallback* above. |
+ 
+ `--stream-vad-merge-gap-ms` defaults to `250` ms and applies only to
+ `--stream-json --vad`. It merges adjacent VAD slices only across gaps smaller
+diff --git i/examples/cli/cli.cpp w/examples/cli/cli.cpp
+index 189070c..37b9e33 100644
+--- i/examples/cli/cli.cpp
++++ w/examples/cli/cli.cpp
+@@ -862,6 +862,12 @@ static bool whisper_params_parse_arg_streaming_tts2(int argc, char** argv, int&
+         params.stream_final_mode = mode;
+     } else if (arg == "--stream-utterance-max-sec") {
+         params.stream_utterance_max_sec = std::stoi(ARGV_NEXT);
++    } else if (arg == "--stream-short-context-sec") {
++        params.stream_short_context_sec = std::stoi(ARGV_NEXT);
++        if (params.stream_short_context_sec < 0) {
++            fprintf(stderr, "crispasr: --stream-short-context-sec must be >= 0\n");
++            exit(2);
++        }
+     } else if (arg == "--firered-vad-debug") {
+         // Issue #84: opt-in debug dump from src/firered_vad.cpp.
+         // Plumbed via env var so src/ doesn't have to learn about
+@@ -1450,6 +1456,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
+             params.stream_final_mode.c_str());
+     fprintf(out, "  --stream-utterance-max-sec N      [%-7d] cap on per-utterance PCM buffer in redecode mode\n",
+             params.stream_utterance_max_sec);
++    fprintf(out,
++            "  --stream-short-context-sec N      [%-7d] redecode a sub-2-s final with up to N s of the audio before "
++            "it (0 = off)\n",
++            params.stream_short_context_sec);
+     fprintf(out, "  --firered-vad-debug               [%-7s] enable FireRed VAD probability/fbank stderr dumps\n",
+             params.firered_vad_debug ? "true" : "false");
+     fprintf(out, "  -n N,      --max-new-tokens N     [%-7d] max new tokens for LLM backends\n", params.max_new_tokens);
+diff --git i/examples/cli/crispasr_run.cpp w/examples/cli/crispasr_run.cpp
+index 855b7aa..2cb669b 100644
+--- i/examples/cli/crispasr_run.cpp
++++ w/examples/cli/crispasr_run.cpp
+@@ -4652,6 +4652,10 @@ int crispasr_run_backend(const whisper_params& params_in) {
+         int64_t utterance_start_sample = 0;
+         int64_t last_speech_end_sample = 0;
+         int64_t finalized_until_sample = 0;
++        // --stream-short-context-sec: the last finalized utterance, which a
++        // short final may borrow as context while the window still holds it.
++        int64_t previous_utterance_start = -1;
++        int64_t previous_utterance_end = -1;
+         std::vector<float> utterance_pcm;
+         std::string prefix_committed;
+         std::string last_partial_text; // dedupe key + prefix-mode tail
+@@ -4690,6 +4694,22 @@ int crispasr_run_backend(const whisper_params& params_in) {
+             return !e || !*e || *e != '0';
+         }();
+         const int64_t utterance_max_samples = (int64_t)params.stream_utterance_max_sec * SR;
++        // Final-text decode of a sub-2-s utterance with the audio in front of
++        // it, its context tokens dropped (see crispasr::plan_short_context).
++        // Empty when the option is off or there is no usable context, so the
++        // caller falls back to the stitched partial.
++        auto transcribe_short_with_context = [&](const whisper_params& decode_params) {
++            const int64_t window_start = cumulative_samples - (int64_t)pcm_window.size();
++            const int64_t utt_end = utterance_start_sample + (int64_t)utterance_pcm.size();
++            const auto plan = crispasr::plan_short_context(window_start, previous_utterance_start,
++                                                           previous_utterance_end, utterance_start_sample, utt_end,
++                                                           (int64_t)params.stream_short_context_sec * SR, SR);
++            if (!plan.use)
++                return std::vector<crispasr_segment>();
++            auto segs = backend->transcribe(pcm_window.data() + (plan.start - window_start),
++                                            (int)(utt_end - plan.start), 0, decode_params);
++            return crispasr::keep_tokens_from(segs, plan.cut_cs);
++        };
+         const int64_t partial_decode_interval_samples =
+             crispasr_stream_partial_decode_interval_samples(params.stream_partial_decode_ms, params.stream_step_ms, SR);
+         // Track whether the audio source ever produced any samples; if
+@@ -5364,16 +5384,20 @@ int crispasr_run_backend(const whisper_params& params_in) {
+                                                        (double)cumulative_samples / (double)SR, step_arrived);
+                         final_text_from_redecode = true; // already post-processed as partials
+                     } else if (params.stream_final_mode == "redecode") {
+-                        if ((int)utterance_pcm.size() >= crispasr::kStreamRedecodeMinSamples) {
+-                            // Disable nested VAD: utterance_pcm is already
+-                            // the speech region we identified, no need to
+-                            // re-segment it (and the nested VAD path would
+-                            // discover the same slices we're collapsing here).
+-                            whisper_params decode_params = params;
+-                            decode_params.vad = false;
+-                            decode_params.vad_model.clear();
+-                            auto utt_segs =
++                        // Disable nested VAD: utterance_pcm is already
++                        // the speech region we identified, no need to
++                        // re-segment it (and the nested VAD path would
++                        // discover the same slices we're collapsing here).
++                        whisper_params decode_params = params;
++                        decode_params.vad = false;
++                        decode_params.vad_model.clear();
++                        std::vector<crispasr_segment> utt_segs;
++                        if ((int)utterance_pcm.size() >= crispasr::kStreamRedecodeMinSamples)
++                            utt_segs =
+                                 backend->transcribe(utterance_pcm.data(), (int)utterance_pcm.size(), 0, decode_params);
++                        else
++                            utt_segs = transcribe_short_with_context(decode_params);
++                        if (!utt_segs.empty()) {
+                             if (stream_punc_finals_enabled(params))
+                                 apply_punc_model(punc_ctx.get(), utt_segs);
+                             apply_truecase_model(tc_ctx.get(), utt_segs);
+@@ -5417,6 +5441,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
+                     // Monotonic: finalized_until_sample only grows.
+                     if (last_speech_end_sample > finalized_until_sample)
+                         finalized_until_sample = last_speech_end_sample;
++                    previous_utterance_start = utterance_start_sample;
++                    previous_utterance_end = last_speech_end_sample;
+                     have_open_utterance = false;
+                     utterance_pcm.clear();
+                     prefix_committed.clear();
+@@ -5711,12 +5737,15 @@ int crispasr_run_backend(const whisper_params& params_in) {
+                                                step_arrived);
+                 final_text_from_redecode = true;
+             } else if (params.stream_final_mode == "redecode") {
+-                if ((int)utterance_pcm.size() >= crispasr::kStreamRedecodeMinSamples) {
+-                    whisper_params decode_params = params;
+-                    decode_params.vad = false;
+-                    decode_params.vad_model.clear();
+-                    auto utt_segs =
+-                        backend->transcribe(utterance_pcm.data(), (int)utterance_pcm.size(), 0, decode_params);
++                whisper_params decode_params = params;
++                decode_params.vad = false;
++                decode_params.vad_model.clear();
++                std::vector<crispasr_segment> utt_segs;
++                if ((int)utterance_pcm.size() >= crispasr::kStreamRedecodeMinSamples)
++                    utt_segs = backend->transcribe(utterance_pcm.data(), (int)utterance_pcm.size(), 0, decode_params);
++                else
++                    utt_segs = transcribe_short_with_context(decode_params);
++                if (!utt_segs.empty()) {
+                     if (stream_punc_finals_enabled(params))
+                         apply_punc_model(punc_ctx.get(), utt_segs);
+                     apply_truecase_model(tc_ctx.get(), utt_segs);
+diff --git i/examples/cli/crispasr_stream_finalize.h w/examples/cli/crispasr_stream_finalize.h
+index ad947f1..bd54909 100755
+--- i/examples/cli/crispasr_stream_finalize.h
++++ w/examples/cli/crispasr_stream_finalize.h
+@@ -10,9 +10,13 @@
+ #pragma once
+ 
+ #include "core/audio_chunking.h"
++#include "crispasr_backend.h"
+ 
+ #include <algorithm>
++#include <cstdint>
++#include <cstring>
+ #include <string>
++#include <vector>
+ 
+ namespace crispasr {
+ 
+@@ -115,4 +119,89 @@ inline PartialTailPlan plan_partial_tail(const float* window_pcm, int anchor, in
+ // skipped and the caller falls back to `stitch_partial_accumulator`.
+ constexpr int kStreamRedecodeMinSamples = 32000;
+ 
++// --stream-short-context-sec: give a short final the audio before it.
++//
++// An utterance under kStreamRedecodeMinSamples is never re-decoded, so its
++// final is the stitched partial of its VAD slice alone. Under a second of
++// speech is often too little for a multilingual model to settle on the
++// language ("Allô ?" comes back as "Hello?"). When the option is on, the
++// short utterance is decoded once more together with up to N s of the audio
++// in front of it, starting no earlier than the previous utterance, and only
++// the tokens after the middle of the silence between the two are kept, and
++// none from more than kShortContextLeadSamples before the utterance's VAD
++// start: speech the VAD missed in a long gap (a word under its minimum
++// duration) must not leak into the final. The lead is generous because a
++// transducer stamps the first word after a long silence early (Parakeet TDT:
++// up to ~0.4 s before the VAD start, measured).
++//
++// plan_short_context decides, in absolute samples, where that decode starts
++// and where its tokens are cut. It is not used when there is no previous
++// utterance, when the rolling window no longer holds any of its speech, or
++// when the combined range would still be under the encoder minimum.
++constexpr int kShortContextLeadSamples = 16000; // 1 s at 16 kHz
++
++struct ShortContextPlan {
++    bool use = false;
++    int64_t start = 0;  // absolute sample the context decode starts at
++    int64_t cut_cs = 0; // tokens before this (centiseconds from `start`) are context
++};
++
++inline ShortContextPlan plan_short_context(int64_t window_start, int64_t prev_start, int64_t prev_end,
++                                           int64_t utt_start, int64_t utt_end, int64_t max_context, int sample_rate) {
++    ShortContextPlan plan;
++    if (max_context <= 0 || prev_start < 0)
++        return plan;
++    const int64_t start = std::max({window_start, prev_start, utt_start - max_context});
++    if (start >= prev_end || utt_end - start < kStreamRedecodeMinSamples)
++        return plan;
++    const int64_t boundary = std::max((prev_end + utt_start) / 2, utt_start - kShortContextLeadSamples);
++    plan.use = true;
++    plan.start = start;
++    plan.cut_cs = (boundary - start) * 100 / sample_rate;
++    return plan;
++}
++
++// Drop the context from a short-context decode: keep the tokens that start at
++// or after `cut_cs` and rebuild each segment's text from them. Returns an
++// empty vector when the backend gave no token timestamps (nothing to cut on),
++// so the caller falls back to the stitched partial as before.
++inline std::vector<crispasr_segment> keep_tokens_from(const std::vector<crispasr_segment>& segs, int64_t cut_cs) {
++    std::vector<crispasr_segment> out;
++    for (const auto& seg : segs) {
++        if (seg.tokens.empty() && !seg.text.empty())
++            return {};
++        crispasr_segment kept;
++        kept.speaker = seg.speaker;
++        kept.lang_id = seg.lang_id;
++        for (const auto& tok : seg.tokens) {
++            if (tok.is_special)
++                continue;
++            if (tok.t0 < 0)
++                return {};
++            if (tok.t0 < cut_cs)
++                continue;
++            if (kept.tokens.empty())
++                kept.t0 = tok.t0;
++            kept.t1 = std::max(tok.t0, tok.t1);
++            kept.text += tok.text;
++            kept.tokens.push_back(tok);
++        }
++        for (const auto& w : seg.words)
++            if (w.t0 >= cut_cs)
++                kept.words.push_back(w);
++        if (!kept.tokens.empty())
++            out.push_back(std::move(kept));
++    }
++    // A punctuation token closing the context phrase can be stamped just past
++    // the cut; a phrase never starts with one, nor with a space.
++    if (!out.empty()) {
++        std::string& t = out.front().text;
++        size_t k = 0;
++        while (k < t.size() && std::strchr(" .,;:?!", t[k]))
++            k++;
++        t.erase(0, k);
++    }
++    return out;
++}
++
+ } // namespace crispasr
+diff --git i/examples/cli/whisper_params.h w/examples/cli/whisper_params.h
+index 940c2bc..aaf698e 100644
+--- i/examples/cli/whisper_params.h
++++ w/examples/cli/whisper_params.h
+@@ -424,6 +424,13 @@ struct whisper_params {
+     // mode. Force-finalize when exceeded so memory stays bounded on
+     // monologues. 60 s × 16 kHz × 4 bytes ≈ 3.84 MB.
+     int32_t stream_utterance_max_sec = 60;
++    // Redecode mode only: when an utterance shorter than the 2 s redecode
++    // minimum is finalized, decode it again with up to N s of the audio in
++    // front of it (from the previous utterance, still in the rolling window)
++    // and keep only its own tokens, so a short phrase gets context to settle
++    // its language. Needs token timestamps. 0 = off (stitched partial, the
++    // previous behavior).
++    int32_t stream_short_context_sec = 0;
+     // Issue #84: gate the noisy `firered_vad: N frames, max_prob=…`
+     // and `fbank[0,:3]=…` stderr dumps in src/firered_vad.cpp behind
+     // an explicit opt-in. Set by --firered-vad-debug (or the
+diff --git i/tests/test-stream-finalize.cpp w/tests/test-stream-finalize.cpp
+index 2503124..0ecd617 100755
+--- i/tests/test-stream-finalize.cpp
++++ w/tests/test-stream-finalize.cpp
+@@ -176,3 +176,80 @@ TEST_CASE("plan_partial_tail: stale anchor beyond the range decodes the full ran
+     REQUIRE_FALSE(plan.commit);
+     REQUIRE(plan.decode_start == 8000);
+ }
++
++// --stream-short-context-sec: a sub-2-s final decoded again with the audio
++// before it. Positions are absolute samples at 16 kHz.
++using crispasr::keep_tokens_from;
++using crispasr::plan_short_context;
++
++namespace {
++constexpr int kSr = 16000;
++
++crispasr_token tok(const char* text, int64_t t0, int64_t t1) {
++    crispasr_token t;
++    t.text = text;
++    t.t0 = t0;
++    t.t1 = t1;
++    return t;
++}
++} // namespace
++
++TEST_CASE("plan_short_context: off, or no previous utterance, decodes nothing", "[unit][stream-json]") {
++    // Previous utterance 1-4 s, short one 5-5.6 s, window holds 0-6 s.
++    REQUIRE_FALSE(plan_short_context(0, 16000, 64000, 80000, 89600, 0, kSr).use);
++    REQUIRE_FALSE(plan_short_context(0, -1, -1, 80000, 89600, 10 * kSr, kSr).use);
++}
++
++TEST_CASE("plan_short_context: starts at the previous utterance, cuts mid-silence", "[unit][stream-json]") {
++    // Previous utterance 1-4.7 s, short one 5-5.6 s.
++    const auto plan = plan_short_context(0, 16000, 75200, 80000, 89600, 10 * kSr, kSr);
++    REQUIRE(plan.use);
++    REQUIRE(plan.start == 16000);
++    // Silence 4.7-5 s, middle 4.85 s, i.e. 3.85 s after the start of the decode.
++    REQUIRE(plan.cut_cs == 385);
++}
++
++TEST_CASE("plan_short_context: cuts at most 1 s before the utterance", "[unit][stream-json]") {
++    // Previous utterance 1-2 s, short one 5-5.6 s: a word the VAD missed in
++    // the 3 s gap must stay out, so the cut is 4 s, not the middle (3.5 s).
++    const auto plan = plan_short_context(0, 16000, 32000, 80000, 89600, 10 * kSr, kSr);
++    REQUIRE(plan.use);
++    REQUIRE(plan.cut_cs == 300);
++}
++
++TEST_CASE("plan_short_context: context is capped by N and by the rolling window", "[unit][stream-json]") {
++    // N = 2 s: start 3 s, inside the previous utterance.
++    REQUIRE(plan_short_context(0, 16000, 64000, 80000, 89600, 2 * kSr, kSr).start == 48000);
++    // Window rolled to 2 s: start there.
++    REQUIRE(plan_short_context(32000, 16000, 64000, 80000, 89600, 10 * kSr, kSr).start == 32000);
++}
++
++TEST_CASE("plan_short_context: previous speech gone from the window decodes nothing", "[unit][stream-json]") {
++    REQUIRE_FALSE(plan_short_context(70000, 16000, 64000, 80000, 89600, 10 * kSr, kSr).use);
++}
++
++TEST_CASE("plan_short_context: never hands the encoder less than the redecode minimum", "[unit][stream-json]") {
++    // Previous 4-4.4 s, short one 5-5.6 s: 1.6 s together, under 2 s.
++    REQUIRE_FALSE(plan_short_context(0, 64000, 70400, 80000, 89600, 10 * kSr, kSr).use);
++}
++
++TEST_CASE("keep_tokens_from: drops the context and its trailing punctuation", "[unit][stream-json]") {
++    crispasr_segment seg;
++    seg.text = " Bonjour à tous. Allô ?";
++    seg.tokens = {tok(" Bonjour", 0, 40), tok(" à", 40, 50),      tok(" tous", 50, 80),
++                  tok(".", 352, 353),     tok(" Allô", 360, 400), tok(" ?", 400, 410)};
++    const auto out = keep_tokens_from({seg}, 350);
++    REQUIRE(out.size() == 1);
++    REQUIRE(out[0].text == "Allô ?");
++    REQUIRE(out[0].tokens.size() == 3);
++    REQUIRE(out[0].t0 == 352);
++    REQUIRE(out[0].t1 == 410);
++}
++
++TEST_CASE("keep_tokens_from: without token timestamps there is nothing to cut on", "[unit][stream-json]") {
++    crispasr_segment seg;
++    seg.text = "Bonjour à tous. Allô ?";
++    REQUIRE(keep_tokens_from({seg}, 350).empty());
++    seg.tokens = {tok(" Bonjour", -1, -1)};
++    REQUIRE(keep_tokens_from({seg}, 350).empty());
++}

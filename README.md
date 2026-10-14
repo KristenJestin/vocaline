@@ -19,9 +19,11 @@ sudo pacman -U vocaline-*.pkg.tar.zst
 ```
 
 It installs `vocaline`, a systemd user unit, this documentation, and the engine under
-`/usr/lib/vocaline/crispasr`: the Linux CUDA 13 bundle of [CrispASR](https://github.com/CrispStrobe/CrispASR)
-0.8.42 (MIT), which also holds the CPU backends. For the `cuda` backend, install `cuda` too.
-The `vulkan` backend is not in it: point `command` at CrispASR's Vulkan bundle (below).
+`/usr/lib/vocaline/crispasr`: [CrispASR](https://github.com/CrispStrobe/CrispASR) 0.8.42 (MIT),
+built from its source with Vocaline's patch (below), with the CUDA backend and the CPU backends,
+which it loads at run time: the same binary runs on a machine without CUDA. For the `cuda`
+backend, install `cuda` too. The `vulkan` backend is not in it: point `command` at CrispASR's
+Vulkan bundle (below).
 Removing the package leaves only your configuration and your models.
 
 Then, as yourself:
@@ -63,18 +65,43 @@ HYPRLAND_INSTANCE_SIGNATURE` at login).
 ## Choosing a model
 
 Parakeet guesses the language by itself and ignores `language`: a short phrase can come out
-in English (`allô` → `Hello?`). **Canary 1B v2** obeys `language`, at a cost: on the same GPU
+in English (`allô` → `Hello?`). The package's engine cuts most of it (below), but not all.
+**Canary 1B v2** obeys `language`, at a cost: on the same GPU
 it takes about 3.5 times the CPU while you speak, 0.4 GB more VRAM and 0.15 s more before each
 final. To use it, set `model = "canary-1b-v2-q8_0.gguf"` and run `vocaline setup` again.
+
+## The engine's patch
+
+Under 2 s, CrispASR never decodes a phrase again: its final is decoded on that short slice
+alone, often too little for Parakeet to settle on the language, so a short French phrase comes
+out in English. `packaging/arch/crispasr-short-context.patch` adds `--stream-short-context-sec
+N` to CrispASR's stream mode: such a phrase is decoded again with up to N s of the audio before
+it (from the previous phrase), and only the words after the silence between them are kept.
+Vocaline passes 10 s (`short_context_sec`). On 144 short synthetic French phrases: not French
+17 → 4, right 114 → 131, about 0.05 s more before a short final and 70 MiB more VRAM. With the
+option off, CrispASR's output is the same as without the patch. The patch is Vocaline's own,
+not part of CrispASR; it is installed with CrispASR's licence.
 
 ## Building it yourself
 
 `cargo build --release` gives a `vocaline` that looks `crispasr` up in `PATH`; set `command`
-to use another one. Take the Linux bundle of a CrispASR release (0.8.42 is the one tested):
-`crispasr-linux-x86_64-cuda13.tar.gz` for an NVIDIA GPU with CUDA 13,
-`crispasr-linux-x86_64-vulkan.tar.gz` for Vulkan, `crispasr-linux-x86_64.tar.gz` for the CPU,
-and unpack it anywhere: the `crispasr` binary finds its libraries next to itself. The package
-itself is built by `makepkg` in `packaging/arch`.
+to use another one. The package itself is built by `makepkg` in `packaging/arch`, CrispASR
+with it (long: CUDA for six GPU architectures).
+
+To build only the patched CrispASR, from a clone of it at `v0.8.42` with its submodules:
+
+```sh
+git apply /path/to/vocaline/packaging/arch/crispasr-short-context.patch
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON \
+  -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON -DGGML_CUDA=ON \
+  -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="$PWD/build/bin" -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+  -DCMAKE_INSTALL_RPATH='$ORIGIN'
+cmake --build build --target crispasr-cli   # build/bin: crispasr and its libraries
+```
+
+`packaging/arch/PKGBUILD` has the exact flags. An upstream CrispASR (a release bundle:
+`crispasr-linux-x86_64-cuda13.tar.gz`, `-vulkan`, or the CPU one) works too, without the
+patch: it does not know the option and refuses to start with it, so set `short_context_sec = 0`.
 
 ## Configuration
 
@@ -91,6 +118,7 @@ language = "fr"
 partial_ms = 400                              # the engine's step: how often it listens, so how soon the end of a phrase is seen
 # partial_decode_ms = 1500                    # not set: the open phrase is decoded at every step; set, this often (0: no grey text, finals only)
 final_silence_ms = 700                        # this much silence ends a phrase
+short_context_sec = 10                        # a phrase under 2 s is decoded again with this much audio before it; 0: off (an upstream CrispASR)
 
 [key]
 hold_ms = 250                                 # a key held this long stops on release (see below)
