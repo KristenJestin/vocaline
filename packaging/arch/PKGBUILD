@@ -7,12 +7,12 @@ pkgrel=1
 pkgdesc='Local dictation: the phrase shows while you speak, and is pasted when you stop'
 arch=(x86_64)
 url='https://github.com/KristenJestin/vocaline'
-# Vocaline is Apache-2.0; the CrispASR it bundles is MIT, and its OpenBLAS BSD-3-Clause.
-license=(Apache-2.0 MIT BSD-3-Clause)
+# Vocaline is Apache-2.0; the CrispASR it bundles, with its ggml, is MIT.
+license=(Apache-2.0 MIT)
 depends=(
   gcc-libs glibc
-  # The GCC runtime CrispASR links: the system's copy instead of the one in its archive.
-  libgomp libgfortran libquadmath
+  libgomp   # CrispASR's threads
+  openblas  # CrispASR's mel filterbank
   curl      # vocaline setup
   pipewire  # pw-record
   wtype     # the paste shortcut
@@ -21,14 +21,27 @@ optdepends=(
   'cuda: the cuda backend, on an NVIDIA GPU'
   'hyprland: pasting where the dictation started'
 )
-makedepends=(cargo git)
-# The engine is a prebuilt release: stripping it gains nothing and risks breaking it.
-options=(!strip !debug)
+makedepends=(cargo git cmake ninja cuda)
+options=(!debug)
 
+# The engine is CrispASR built from its source at a release, with Vocaline's patch
+# (crispasr-short-context.patch: --stream-short-context-sec). Its ggml and c2pa-audio are
+# submodules, and its tests fetch Catch2 at configure time: all are sources here, so the build
+# needs no network.
 _crispasr=0.8.42
-_bundle=crispasr-linux-x86_64-cuda13
-source=("crispasr-$_crispasr-cuda13.tar.gz::https://github.com/CrispStrobe/CrispASR/releases/download/v$_crispasr/$_bundle.tar.gz")
-sha256sums=('8bfb828151fd3c9c15e49bbd5a7946ccb1c332be68eb9b3b029fcc4e3e4ce4d2')
+_ggml=c36dab89b662838f0f5d4826c399198c0b90bbfc
+_c2pa_audio=e40329b83f16f67bb5ddc7bb13ae18de0a9376fc
+_catch2=3.7.1
+source=("crispasr::git+https://github.com/CrispStrobe/CrispASR.git#tag=v$_crispasr"
+        "ggml::git+https://github.com/CrispStrobe/ggml.git#commit=$_ggml"
+        "c2pa-audio::git+https://github.com/CrispStrobe/c2pa-audio.git#commit=$_c2pa_audio"
+        "catch2::git+https://github.com/catchorg/Catch2.git#tag=v$_catch2"
+        crispasr-short-context.patch)
+sha256sums=('8891fd0a2130082e591ffb02d180630341b4bc140ac7fb7819e12abee12d9b02'
+            'd55bb0a99001dd675428907deb77193741a461da1fdfff21bc801ddb963995c2'
+            'c17e5033b8d476651b69bd7193eb9371876cf4375759789c153119298c503532'
+            '63ff271325220bc5df168fd1efe694c80678dddac2889dd5603219b4383c3cbe'
+            '6c048d9de53f4e11511e523f9fc17e533c16699e067651631e33d164c9656003')
 
 _root=$(realpath "$startdir/../..")
 
@@ -60,10 +73,57 @@ pkgver() {
 }
 
 prepare() {
+  cd "$srcdir/crispasr"
+  local module
+  for module in ggml third_party/c2pa-audio; do
+    git submodule init "$module"
+    git config "submodule.$module.url" "$srcdir/${module##*/}"
+    git -c protocol.file.allow=always submodule update "$module"
+  done
+  patch -Np1 -i "$srcdir/crispasr-short-context.patch"
+
   cargo fetch --locked --manifest-path "$_root/Cargo.toml" --target "$(rustc -vV | sed -n 's/^host: //p')"
 }
 
+_build_crispasr() {
+  # The prebuilt CUDA 13 bundle's setup: the ggml backends are loaded at run time, so the same
+  # binary runs on the CPU where CUDA is missing, with a CPU variant per generation (x64 to
+  # Sapphire Rapids and Zen 4). CUDA from Turing (sm_75) to Blackwell (sm_120), plus PTX for
+  # what comes after. Every library is built into bin/ and found beside crispasr, wherever it
+  # is installed (the tests' Catch2 too, so they run from there).
+  cmake -S "$srcdir/crispasr" -B "$srcdir/crispasr-build" -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=ON \
+    -DGGML_BACKEND_DL=ON \
+    -DGGML_NATIVE=OFF \
+    -DGGML_CPU_ALL_VARIANTS=ON \
+    -DGGML_CUDA=ON \
+    -DCMAKE_CUDA_COMPILER=/opt/cuda/bin/nvcc \
+    -DCMAKE_CUDA_HOST_COMPILER="$(sed -n "s/^export NVCC_CCBIN='\(.*\)'$/\1/p" /etc/profile.d/cuda.sh)" \
+    -DCMAKE_CUDA_ARCHITECTURES='75-real;80-real;86-real;89-real;90-real;90-virtual;120a-real;120-virtual' \
+    -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="$srcdir/crispasr-build/bin" \
+    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+    -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+    -DCRISPASR_BUILD_EXAMPLES=ON \
+    -DCRISPASR_BUILD_SERVER=OFF \
+    -DCRISPASR_BUILD_TESTS=ON \
+    -DCRISPASR_OPUS=OFF \
+    -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
+    -DFETCHCONTENT_SOURCE_DIR_CATCH2="$srcdir/catch2"
+  cmake --build "$srcdir/crispasr-build" --target crispasr-cli test-stream-finalize
+}
+
 build() {
+  # Compiling CrispASR's CUDA kernels takes hours: CI keeps the bin/ it built, keyed on what
+  # it is built from (.github/workflows/package.yml), and hands it back here when none of that
+  # changed. A local makepkg always builds it.
+  if [[ -n ${VOCALINE_CRISPASR_BUILT:-} ]]; then
+    mkdir -p "$srcdir/crispasr-build"
+    cp -a "$VOCALINE_CRISPASR_BUILT" "$srcdir/crispasr-build/bin"
+  else
+    _build_crispasr
+  fi
+
   export CARGO_TARGET_DIR="$srcdir/target"
   export VOCALINE_ENGINE=/usr/lib/vocaline/crispasr/crispasr
   export VOCALINE_VERSION=$pkgver
@@ -71,6 +131,8 @@ build() {
 }
 
 check() {
+  "$srcdir/crispasr-build/bin/test-stream-finalize"
+
   export CARGO_TARGET_DIR="$srcdir/target"
   export VOCALINE_ENGINE=/usr/lib/vocaline/crispasr/crispasr
   export VOCALINE_VERSION=$pkgver
@@ -83,11 +145,11 @@ package() {
   install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" "$_root/LICENSE" "$_root/NOTICE"
   install -Dm644 -t "$pkgdir/usr/share/doc/vocaline" "$_root/README.md" "$_root/docs/events.md"
 
-  # The engine keeps its archive's layout: crispasr finds its libraries beside itself.
+  # The engine keeps the layout of the prebuilt bundle: crispasr finds its libraries beside itself.
   local engine="$pkgdir/usr/lib/vocaline/crispasr"
-  install -d "$engine"
-  cp -a "$srcdir/$_bundle/." "$engine/"
-  rm "$engine"/{libgomp.so.1,libgfortran.so.5,libquadmath.so.0}
-  install -d "$pkgdir/usr/share/licenses/$pkgname/crispasr"
-  mv "$engine"/{LICENSE,THIRD_PARTY_NOTICES.txt} "$pkgdir/usr/share/licenses/$pkgname/crispasr/"
+  install -Dm755 -t "$engine" "$srcdir/crispasr-build/bin/crispasr"
+  cp -P "$srcdir/crispasr-build/bin"/{libcrispasr,libggml,libggml-base}.so.* \
+    "$srcdir/crispasr-build/bin"/libggml-{cpu-*,cuda}.so "$engine/"
+  install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname/crispasr" \
+    "$srcdir/crispasr"/{LICENSE,THIRD_PARTY_NOTICES.txt} "$srcdir/crispasr-short-context.patch"
 }
