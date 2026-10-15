@@ -8,6 +8,7 @@
 
 use serde::Deserialize;
 use std::io::{self, Read};
+use std::os::fd::AsFd;
 use std::process::Command;
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -465,19 +466,17 @@ impl Clipboard for Wayland {
             Err(Error::ClipboardEmpty | Error::NoSeats) => return Ok(Vec::new()),
             Err(e) => return Err(io::Error::other(e)),
         };
-        let mut contents = Vec::new();
+        let mut pipes = Vec::new();
         for mime in types {
-            let (mut pipe, _) = paste::get_contents(
+            let (pipe, _) = paste::get_contents(
                 ClipboardType::Regular,
                 Seat::Unspecified,
                 MimeType::Specific(&mime),
             )
             .map_err(io::Error::other)?;
-            let mut bytes = Vec::new();
-            pipe.read_to_end(&mut bytes)?;
-            contents.push((mime, bytes));
+            pipes.push((mime, pipe));
         }
-        Ok(contents)
+        Ok(drain(pipes, STRAGGLER, UNSERVED))
     }
 
     fn set_text(&self, text: &str) -> io::Result<mpsc::Receiver<Instant>> {
@@ -500,6 +499,82 @@ impl Clipboard for Wayland {
         options.omit_additional_text_mime_types(true);
         options.copy_multi(sources).map_err(io::Error::other)
     }
+}
+
+/// How long a type is waited for once every other one is read: a source may offer a type it
+/// never serves (a Firefox-based browser offers `COMPOUND_TEXT` and `SAVE_TARGETS`), and
+/// keeps its pipe open without writing.
+const STRAGGLER: Duration = Duration::from_millis(100);
+/// How long a source is waited for at most: a busy one is slow for every type, not stuck.
+const UNSERVED: Duration = Duration::from_secs(2);
+
+/// Reads every pipe to its end, all at once. A type not read in time is dropped: the rest of
+/// the clipboard comes back without it, rather than no paste ever again.
+fn drain<P: Read + AsFd>(pipes: Vec<(String, P)>, straggler: Duration, cap: Duration) -> Contents {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    use rustix::fs::{OFlags, fcntl_setfl};
+    // Each type with what was read of it, and whether its pipe is still open.
+    let mut types: Vec<_> = pipes
+        .into_iter()
+        .map(|(mime, pipe)| {
+            let open = fcntl_setfl(&pipe, OFlags::NONBLOCK).is_ok();
+            (mime, pipe, Vec::new(), open)
+        })
+        .collect();
+    let mut read = vec![false; types.len()];
+    let started = Instant::now();
+    let mut last_read = None;
+    loop {
+        let deadline = match last_read {
+            Some(at) => (started + cap).min(at + straggler),
+            None => started + cap,
+        };
+        let open: Vec<usize> = (0..types.len()).filter(|&i| types[i].3).collect();
+        let left = deadline.saturating_duration_since(Instant::now());
+        if open.is_empty() || left.is_zero() {
+            break;
+        }
+        let mut fds: Vec<_> = open
+            .iter()
+            .map(|&i| PollFd::new(&types[i].1, PollFlags::IN))
+            .collect();
+        let timeout = Timespec::try_from(left).ok();
+        if poll(&mut fds, timeout.as_ref()).is_err_and(|e| e != rustix::io::Errno::INTR) {
+            break;
+        }
+        let ready: Vec<usize> = open
+            .into_iter()
+            .zip(&fds)
+            .filter(|(_, fd)| !fd.revents().is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        drop(fds);
+        for i in ready {
+            let (_, pipe, bytes, open) = &mut types[i];
+            let mut chunk = [0; 64 * 1024];
+            match pipe.read(&mut chunk) {
+                Ok(0) => {
+                    *open = false;
+                    read[i] = true;
+                    last_read = Some(Instant::now());
+                }
+                Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                // A source that failed is one type less, as one that never answers.
+                Err(_) => {
+                    *open = false;
+                    last_read = Some(Instant::now());
+                }
+            }
+        }
+    }
+    types
+        .into_iter()
+        .zip(read)
+        .filter(|(_, read)| *read)
+        .map(|((mime, _, bytes, _), _)| (mime, bytes))
+        .collect()
 }
 
 mod selection;

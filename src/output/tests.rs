@@ -1,4 +1,5 @@
 use super::*;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -634,4 +635,61 @@ fn a_clipboard_history_that_reads_the_phrase_late_is_let_through_before_the_shor
     s.begin();
     s.output.phrase("Bonjour.".into());
     assert_eq!(s.wait_for_pastes(1), ["Bonjour."]);
+}
+
+/// A clipboard type as its source serves it: a pipe, and the end the source writes to.
+fn served(mime: &str) -> ((String, io::PipeReader), io::PipeWriter) {
+    let (reader, writer) = io::pipe().unwrap();
+    ((mime.into(), reader), writer)
+}
+
+const STRAGGLER: Duration = Duration::from_millis(50);
+
+#[test]
+fn a_type_whose_source_never_answers_is_dropped() {
+    let (pipe, _held_open) = served("SAVE_TARGETS");
+    let started = Instant::now();
+    assert_eq!(drain(vec![pipe], STRAGGLER, BUSY), Vec::new());
+    assert!(started.elapsed() < WAIT, "{:?}", started.elapsed());
+}
+
+#[test]
+fn the_types_that_answer_are_kept_when_one_never_does() {
+    let (text, mut writer) = served("text/plain");
+    let (compound, _held_open) = served("COMPOUND_TEXT");
+    let (html, mut html_writer) = served("text/html");
+    writer.write_all(b"copied").unwrap();
+    drop(writer);
+    html_writer.write_all(b"<b>copied</b>").unwrap();
+    drop(html_writer);
+    let started = Instant::now();
+    let kept = drain(vec![text, compound, html], STRAGGLER, WAIT);
+    assert_eq!(
+        kept,
+        vec![
+            ("text/plain".to_string(), b"copied".to_vec()),
+            ("text/html".to_string(), b"<b>copied</b>".to_vec()),
+        ]
+    );
+    // Past the others, the one that never answers costs the straggler, not the cap.
+    assert!(started.elapsed() < WAIT / 2, "{:?}", started.elapsed());
+}
+
+#[test]
+fn a_source_slow_for_every_type_is_waited_for() {
+    let (text, mut writer) = served("text/plain");
+    let (html, mut html_writer) = served("text/html");
+    thread::spawn(move || {
+        thread::sleep(STRAGGLER * 4);
+        writer.write_all(b"copied").unwrap();
+        drop(writer);
+        html_writer.write_all(b"<b>copied</b>").unwrap();
+    });
+    assert_eq!(
+        drain(vec![text, html], STRAGGLER, WAIT),
+        vec![
+            ("text/plain".to_string(), b"copied".to_vec()),
+            ("text/html".to_string(), b"<b>copied</b>".to_vec()),
+        ]
+    );
 }
