@@ -105,14 +105,17 @@ jobs:
           pacman -Qip ./*.pkg.tar.zst
           pacman -Qlp ./*.pkg.tar.zst
           namcap ./*.pkg.tar.zst
-      # Only for the publication, which deletes it once published: a package is 170 MB and the
-      # Actions storage is small.
+      # Handed to the publication through the Actions cache, not an artifact: a package is 170 MB
+      # and artifacts count in the account's small Actions storage, the cache does not. The
+      # publication deletes it.
+      - name: Set the package aside for the publication
+        if: github.event_name == 'push'
+        run: mkdir dist && cp packaging/arch/*.pkg.tar.zst dist/
       - if: github.event_name == 'push'
-        uses: actions/upload-artifact@v4
+        uses: actions/cache/save@v4
         with:
-          name: package
-          path: packaging/arch/*.pkg.tar.zst
-          retention-days: 1
+          key: package-${{ github.run_id }}
+          path: dist
 
   publish:
     if: github.event_name == 'push'
@@ -128,23 +131,23 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/cache/restore@v4
         with:
-          name: package
+          key: package-${{ github.run_id }}
+          path: dist
+          fail-on-cache-miss: true
       # One `dev` pre-release, replaced each time: its tag moves to the commit just built. The tag
       # is not `dev`: a tag named like the branch makes `git push origin dev` ambiguous.
       - name: Publish the dev pre-release
         if: github.ref == 'refs/heads/dev'
         run: |
           gh release delete dev-latest --yes --cleanup-tag || true
-          gh release create dev-latest ./*.pkg.tar.zst --prerelease --target "$GITHUB_SHA" \
+          gh release create dev-latest dist/*.pkg.tar.zst --prerelease --target "$GITHUB_SHA" \
             --title "dev" --notes "The integration branch, built from $GITHUB_SHA."
       - name: Publish the release
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          gh release create "$GITHUB_REF_NAME" ./*.pkg.tar.zst --verify-tag \
+          gh release create "$GITHUB_REF_NAME" dist/*.pkg.tar.zst --verify-tag \
             --title "$GITHUB_REF_NAME" --notes "Built from $GITHUB_SHA."
-      - name: Delete the artifact, now in the release
-        run: |
-          gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/artifacts" --jq '.artifacts[].id' |
-            while read -r id; do gh api --method DELETE "repos/$GH_REPO/actions/artifacts/$id"; done
+      - name: Delete the cache entry, now in the release
+        run: gh cache delete "package-$GITHUB_RUN_ID"
