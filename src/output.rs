@@ -267,7 +267,12 @@ impl Worker {
     fn paste(&mut self, text: &str) -> io::Result<()> {
         self.wait_for_modifiers();
         if self.saved.is_none() {
-            self.saved = Some(self.ports.clipboard.save()?);
+            self.saved = Some(self.ports.clipboard.save().unwrap_or_else(|e| {
+                // The phrase is pasted all the same: losing the user's clipboard is better
+                // than losing the dictation too. Nothing saved is put back as empty.
+                eprintln!("vocaline: the clipboard could not be saved, it will be emptied: {e}");
+                Vec::new()
+            }));
         }
         let class = self.focus_target();
         self.wait_for_read();
@@ -468,15 +473,21 @@ impl Clipboard for Wayland {
         };
         let mut pipes = Vec::new();
         for mime in types {
-            let (pipe, _) = paste::get_contents(
+            // A type the source withdrew since is one type less, not a lost clipboard.
+            if let Ok((pipe, _)) = paste::get_contents(
                 ClipboardType::Regular,
                 Seat::Unspecified,
                 MimeType::Specific(&mime),
-            )
-            .map_err(io::Error::other)?;
-            pipes.push((mime, pipe));
+            ) {
+                pipes.push((mime, pipe));
+            }
         }
-        Ok(drain(pipes, STRAGGLER, UNSERVED))
+        if pipes.is_empty() {
+            return Err(io::Error::other(
+                "no type of the clipboard could be asked for",
+            ));
+        }
+        drain(pipes, STRAGGLER, UNSERVED)
     }
 
     fn set_text(&self, text: &str) -> io::Result<mpsc::Receiver<Instant>> {
@@ -501,80 +512,84 @@ impl Clipboard for Wayland {
     }
 }
 
-/// How long a type is waited for once every other one is read: a source may offer a type it
-/// never serves (a Firefox-based browser offers `COMPOUND_TEXT` and `SAVE_TARGETS`), and
-/// keeps its pipe open without writing.
+/// How long the types still unread are waited for once the others stop coming: a source may
+/// offer a type it never serves (a Firefox-based browser offers `COMPOUND_TEXT` and
+/// `SAVE_TARGETS`), and keeps its pipe open without writing.
 const STRAGGLER: Duration = Duration::from_millis(100);
-/// How long a source is waited for at most: a busy one is slow for every type, not stuck.
-const UNSERVED: Duration = Duration::from_secs(2);
+/// How long a source that answers nothing is waited for: a busy one is slow, not stuck.
+const UNSERVED: Duration = Duration::from_secs(5);
 
-/// Reads every pipe to its end, all at once. A type not read in time is dropped: the rest of
-/// the clipboard comes back without it, rather than no paste ever again.
-fn drain<P: Read + AsFd>(pipes: Vec<(String, P)>, straggler: Duration, cap: Duration) -> Contents {
+/// Reads every pipe to its end, all at once. A type still unread `straggler` after the last
+/// byte of any type came is dropped: the rest of the clipboard comes back without it, rather
+/// than no paste ever again. When none is read within `cap`, the clipboard is not saved.
+fn drain<P: Read + AsFd>(
+    pipes: Vec<(String, P)>,
+    straggler: Duration,
+    cap: Duration,
+) -> io::Result<Contents> {
     use rustix::event::{PollFd, PollFlags, Timespec, poll};
-    use rustix::fs::{OFlags, fcntl_setfl};
-    // Each type with what was read of it, and whether its pipe is still open.
-    let mut types: Vec<_> = pipes
+    let offered = pipes.len();
+    let mut open: Vec<(String, P, Vec<u8>)> = pipes
         .into_iter()
-        .map(|(mime, pipe)| {
-            let open = fcntl_setfl(&pipe, OFlags::NONBLOCK).is_ok();
-            (mime, pipe, Vec::new(), open)
-        })
+        .map(|(mime, pipe)| (mime, pipe, Vec::new()))
         .collect();
-    let mut read = vec![false; types.len()];
+    // In the order the source offered them, as they are put back.
+    let mut read: Vec<Option<(String, Vec<u8>)>> = (0..offered).map(|_| None).collect();
+    let mut index: Vec<usize> = (0..offered).collect();
     let started = Instant::now();
-    let mut last_read = None;
-    loop {
-        let deadline = match last_read {
+    let mut came = None;
+    let mut chunk = vec![0; 64 * 1024];
+    while !open.is_empty() {
+        let deadline = match came {
             Some(at) => (started + cap).min(at + straggler),
             None => started + cap,
         };
-        let open: Vec<usize> = (0..types.len()).filter(|&i| types[i].3).collect();
         let left = deadline.saturating_duration_since(Instant::now());
-        if open.is_empty() || left.is_zero() {
+        if left.is_zero() {
             break;
         }
         let mut fds: Vec<_> = open
             .iter()
-            .map(|&i| PollFd::new(&types[i].1, PollFlags::IN))
+            .map(|(_, pipe, _)| PollFd::new(pipe, PollFlags::IN))
             .collect();
         let timeout = Timespec::try_from(left).ok();
         if poll(&mut fds, timeout.as_ref()).is_err_and(|e| e != rustix::io::Errno::INTR) {
             break;
         }
-        let ready: Vec<usize> = open
-            .into_iter()
-            .zip(&fds)
-            .filter(|(_, fd)| !fd.revents().is_empty())
-            .map(|(i, _)| i)
-            .collect();
+        let ready: Vec<bool> = fds.iter().map(|fd| !fd.revents().is_empty()).collect();
         drop(fds);
-        for i in ready {
-            let (_, pipe, bytes, open) = &mut types[i];
-            let mut chunk = [0; 64 * 1024];
-            match pipe.read(&mut chunk) {
+        // Backwards, so removing one leaves the indices of the others still to visit.
+        for at in (0..open.len()).rev() {
+            if !ready[at] {
+                continue;
+            }
+            // A pipe that poll calls readable does not block a read.
+            match open[at].1.read(&mut chunk) {
                 Ok(0) => {
-                    *open = false;
-                    read[i] = true;
-                    last_read = Some(Instant::now());
+                    let (mime, _, bytes) = open.remove(at);
+                    read[index.remove(at)] = Some((mime, bytes));
+                    came = Some(Instant::now());
                 }
-                Ok(n) => bytes.extend_from_slice(&chunk[..n]),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Ok(n) => {
+                    open[at].2.extend_from_slice(&chunk[..n]);
+                    came = Some(Instant::now());
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                // A source that failed is one type less, as one that never answers.
+                // A type that failed is dropped, as one that never answers.
                 Err(_) => {
-                    *open = false;
-                    last_read = Some(Instant::now());
+                    open.remove(at);
+                    index.remove(at);
                 }
             }
         }
     }
-    types
-        .into_iter()
-        .zip(read)
-        .filter(|(_, read)| *read)
-        .map(|((mime, _, bytes, _), _)| (mime, bytes))
-        .collect()
+    let contents: Contents = read.into_iter().flatten().collect();
+    if contents.is_empty() && offered > 0 {
+        return Err(io::Error::other(
+            "the source of the clipboard did not answer",
+        ));
+    }
+    Ok(contents)
 }
 
 mod selection;
