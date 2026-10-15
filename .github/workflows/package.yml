@@ -105,11 +105,14 @@ jobs:
           pacman -Qip ./*.pkg.tar.zst
           pacman -Qlp ./*.pkg.tar.zst
           namcap ./*.pkg.tar.zst
-      - uses: actions/upload-artifact@v4
+      # Only for the publication, which deletes it once published: a package is 170 MB and the
+      # Actions storage is small.
+      - if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
         with:
           name: package
           path: packaging/arch/*.pkg.tar.zst
-          retention-days: 7
+          retention-days: 1
 
   publish:
     if: github.event_name == 'push'
@@ -117,6 +120,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     # Two pushes to dev in a row must not interleave their delete and create.
     concurrency:
       group: publish-${{ github.ref }}
@@ -140,3 +144,7 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" ./*.pkg.tar.zst --verify-tag \
             --title "$GITHUB_REF_NAME" --notes "Built from $GITHUB_SHA."
+      - name: Delete the artifact, now in the release
+        run: |
+          gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/artifacts" --jq '.artifacts[].id' |
+            while read -r id; do gh api --method DELETE "repos/$GH_REPO/actions/artifacts/$id"; done
