@@ -1,344 +1,103 @@
-# Vocaline
+<div align="center">
 
-Local dictation for Linux: the phrase shows while you speak, and the dictation is pasted once, when it stops.
-Parakeet through CrispASR, on the GPU when there is one. Nothing leaves the machine.
+<img src="assets/brand/png/social-preview.png" alt="Vocaline: the voice level, a phrase frozen after a pause and the next one still forming in grey, as the desktop shows them while you speak" width="100%">
 
-Work in progress: see the issues. Agents read `AGENTS.md`.
+</div>
 
-## Installing it (Arch Linux)
+## What it is
 
-CI builds the package: the `dev-latest` pre-release follows the integration branch, each `v*`
-release a version. A release from the tag `vX.Y.Z` is version `X.Y.Z` (the tag must match
-`Cargo.toml`); any other build is `X.Y.Z.rN.gHASH`, N commits after the last release tag
-(`0.0.0` before the first), so pacman sees a dev build as newer than the release it follows
-and older than the next one. `vocaline --version` prints the same string.
+Local dictation for Linux (Wayland, Hyprland), written in Rust.
+
+While you speak, you watch the phrase form: it shows in grey while the model still hesitates, and
+freezes at each pause. When you stop, the whole dictation is pasted once, in the window you
+started in. The model is NVIDIA's Parakeet TDT 0.6B v3, run by
+[CrispASR](https://github.com/CrispStrobe/CrispASR) on the GPU when there is one, on the CPU
+otherwise. Three rules shape it:
+
+- **Nothing leaves the machine.** No account, no server, no telemetry. What you dictate is kept
+  only where you ask for it (`vocaline last`, in memory), and the statistics count words, never
+  store them.
+- **The GPU is borrowed, not taken.** The model is loaded when you start speaking (about 0.4 s,
+  and what you say meanwhile is kept) and unloaded when you stop: between two dictations,
+  Vocaline holds no video memory at all. When the GPU is full, the dictation is decoded on the
+  CPU instead of being lost.
+- **Vocaline grabs no key and draws nothing.** A daemon owns the microphone and the engine, and
+  publishes what it hears as an event stream. Your desktop binds a key to `vocaline press` and
+  `vocaline release`; a bar, a notification or a voice assistant reads the stream and shows the
+  phrase being spoken, or only listens.
+
+## How it works
+
+```mermaid
+flowchart LR
+    key([Your key]) -- "press / release" --> daemon{{The daemon}}
+    mic([The microphone]) --> daemon
+    daemon -- "audio, cut at each pause" --> engine[CrispASR and Parakeet]
+    engine -- "the phrase, again and again" --> daemon
+    daemon -- "events: partial, final" --> shell[A desktop shell, the phrase in grey]
+    daemon -- "events" --> assistant[A voice assistant]
+    daemon -- "when you stop: pasted once" --> window[The window you started in]
+```
+
+1. **You press the key.** Hold it while you speak and release it, or tap it once to start and
+   once to stop. The microphone opens at once; the model loads behind it.
+2. **The phrase forms.** A voice detector (Silero VAD) cuts the speech at each pause. The open
+   phrase is decoded again every 400 ms: a `partial`, the grey text. After 700 ms of silence it
+   is decoded a last time and frozen: a `final`.
+3. **Your words are fixed.** Your own vocabulary corrects the names the model gets wrong, the
+   filler words (`euh`, `um`) go, and the phrases a pause cut in the middle of a sentence are
+   joined again.
+4. **It is pasted where you were.** When you stop, the dictation goes through the clipboard into
+   the window that had the focus when you started, and your clipboard is given back, with
+   everything it held, once the application has read it. A rule per application can press Enter
+   after it, drop the final period, or paste nothing.
+
+## Install
+
+On Arch Linux, each release carries a package (`vocaline-<version>-1-x86_64.pkg.tar.zst`) with
+Vocaline, a systemd user service and its own build of CrispASR, CUDA and CPU in the same binary:
 
 ```sh
-gh release download dev-latest -R KristenJestin/vocaline -p '*.pkg.tar.zst'   # or a v* tag
 sudo pacman -U vocaline-*.pkg.tar.zst
-```
-
-It installs `vocaline`, a systemd user unit, this documentation, and the engine under
-`/usr/lib/vocaline/crispasr`: [CrispASR](https://github.com/CrispStrobe/CrispASR) 0.8.42 (MIT),
-built from its source with Vocaline's patch (below), with the CUDA backend and the CPU backends,
-which it loads at run time: the same binary runs on a machine without CUDA. For the `cuda`
-backend, install `cuda` too. The `vulkan` backend is not in it: point `command` at CrispASR's
-Vulkan bundle (below).
-Removing the package leaves only your configuration and your models.
-
-Then, as yourself:
-
-```sh
 vocaline setup                                   # downloads the models, their size shown first
-systemctl --user enable --now vocaline.service   # the daemon, with the graphical session
+systemctl --user enable --now vocaline.service
 ```
 
-`vocaline setup` downloads the model and the VAD model the configuration names into
-`~/.local/share/vocaline/models`, checks their sha256, and leaves alone a file already there:
-Parakeet TDT 0.6B v3 q8_0 (674 MB) and Silero VAD v6.2.0 (0.9 MB) by default. It knows
-`parakeet-tdt-0.6b-v3-q8_0.gguf`, `-q5_0`, `-q4_k` (for a smaller machine) and
-`canary-1b-v2-q8_0.gguf`; another file, put it in the models folder yourself.
-
-Without an NVIDIA GPU (`nvidia-smi -L` lists none), `vocaline setup` sets the engine up for the
-CPU. With no `config.toml` yet it writes this block, says so, and downloads the q4_k model:
-
-```toml
-[engine]
-model = "parakeet-tdt-0.6b-v3-q4_k.gguf"
-backend = "cpu"
-partial_ms = 1500
-```
-
-On the CPU it takes about half the CPU of the default and keeps up with a long phrase; the
-first grey text comes about a second later (1.7 s instead of 0.7 s). On a machine without a
-GPU, `partial_decode_ms` goes further: the grey text is decoded on its own cadence while the
-step stays short, so a phrase still ends as soon as the pause is heard. `0` decodes no grey text
-at all (the engine still emits about one just before each final). A `config.toml` that
-exists is never edited: if it does not set `backend`, setup prints the block for you to copy.
-
-The unit is bound to `graphical-session.target`, which Hyprland started through `uwsm`
-reaches. The daemon pastes through Wayland and asks Hyprland which window has the focus: the
-user manager must have `WAYLAND_DISPLAY` and `HYPRLAND_INSTANCE_SIGNATURE` in its environment
-(`uwsm` does it; otherwise `systemctl --user import-environment WAYLAND_DISPLAY
-HYPRLAND_INSTANCE_SIGNATURE` at login).
-
-## Choosing a model
-
-Parakeet guesses the language by itself and ignores `language`: a short phrase can come out
-in English (`allô` → `Hello?`). The package's engine cuts most of it (below), but not all.
-**Canary 1B v2** obeys `language`, at a cost: on the same GPU
-it takes about 3.5 times the CPU while you speak, 0.4 GB more VRAM and 0.15 s more before each
-final. To use it, set `model = "canary-1b-v2-q8_0.gguf"` and run `vocaline setup` again.
-
-## The engine's patch
-
-Under 2 s, CrispASR never decodes a phrase again: its final is decoded on that short slice
-alone, often too little for Parakeet to settle on the language, so a short French phrase comes
-out in English. `packaging/arch/crispasr-short-context.patch` adds `--stream-short-context-sec
-N` to CrispASR's stream mode: such a phrase is decoded again with up to N s of the audio before
-it (from the previous phrase), and only the words after the silence between them are kept.
-Vocaline passes 10 s (`short_context_sec`). On 144 short synthetic French phrases: not French
-17 → 4, right 114 → 131, about 0.05 s more before a short final and 70 MiB more VRAM. With the
-option off, CrispASR's output is the same as without the patch. The patch is Vocaline's own,
-not part of CrispASR; it is installed with CrispASR's licence.
-
-## Building it yourself
-
-`cargo build --release` gives a `vocaline` that looks `crispasr` up in `PATH`; set `command`
-to use another one. The package itself is built by `makepkg` in `packaging/arch`, CrispASR
-with it (long: CUDA for six GPU architectures).
-
-To build only the patched CrispASR, from a clone of it at `v0.8.42` with its submodules:
-
-```sh
-git apply /path/to/vocaline/packaging/arch/crispasr-short-context.patch
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON \
-  -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON -DGGML_CUDA=ON \
-  -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="$PWD/build/bin" -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-  -DCMAKE_INSTALL_RPATH='$ORIGIN'
-cmake --build build --target crispasr-cli   # build/bin: crispasr and its libraries
-```
-
-`packaging/arch/PKGBUILD` has the exact flags. An upstream CrispASR (a release bundle:
-`crispasr-linux-x86_64-cuda13.tar.gz`, `-vulkan`, or the CPU one) works too, without the
-patch: it does not know the option and refuses to start with it, so set `short_context_sec = 0`.
-
-## Configuration
-
-`$XDG_CONFIG_HOME/vocaline/config.toml` (usually `~/.config/vocaline/config.toml`); every key is
-optional, these are the defaults:
-
-```toml
-[engine]
-command = "/usr/lib/vocaline/crispasr/crispasr" # the package's engine ("crispasr", from PATH, built by hand)
-model = "parakeet-tdt-0.6b-v3-q8_0.gguf"      # or canary-1b-v2-q8_0.gguf; relative: read from ~/.local/share/vocaline/models
-vad_model = "ggml-silero-v6.2.0.bin"          # relative: read from the models folder; "auto": CrispASR fetches it
-backend = "cuda"                              # cuda, vulkan or cpu
-language = "fr"
-partial_ms = 400                              # the engine's step: how often it listens, so how soon the end of a phrase is seen
-# partial_decode_ms = 1500                    # not set: the open phrase is decoded at every step; set, this often (0: no grey text, finals only)
-final_silence_ms = 700                        # this much silence ends a phrase
-short_context_sec = 10                        # a phrase under 2 s is decoded again with this much audio before it; 0: off (an upstream CrispASR)
-
-[key]
-hold_ms = 250                                 # a key held this long stops on release (see below)
-
-[output]
-paste = true                                  # false: the phrases are only in the event stream
-
-[text]
-filler_words = ["euh", "heu", "euhm", "hum", "hmm", "mmh", "uh", "um", "mm"]  # dropped from every phrase; []: off
-```
-
-Rules per application are `[[rule]]` tables, none by default: see "Rules per application".
-
-## Using it
-
-```sh
-vocaline daemon &      # owns the microphone (PipeWire, through pw-record) and the engine; or the unit
-vocaline watch         # the event stream, one JSON object per line (docs/events.md)
-vocaline start         # or stop, toggle, status
-```
-
-The model is loaded when listening starts and unloaded when it stops.
-`vocaline daemon --audio-file speech.wav` plays a 16 kHz mono recording instead of the
-microphone at each `start`: to try a machine without speaking.
-
-## One key for hold and tap
-
-Vocaline grabs no key: bind `vocaline press` to the key going down and `vocaline release` to the
-same key going up. On Hyprland:
+`vocaline setup` picks the model for the machine: Parakeet q8_0 (674 MB) on an NVIDIA GPU, a
+lighter q4_k with a slower grey text on the CPU. Then bind a key, on Hyprland:
 
 ```
 bind = SUPER, A, exec, vocaline press
 bindr = SUPER, A, exec, vocaline release
 ```
 
-Hold the key while you speak and release it to stop. Or tap it (shorter than `hold_ms`): it keeps
-listening, and the next press stops it. Either way, the phrase being spoken is finalised first.
-`start`, `stop` and `toggle` stay for a button or another program.
+The package, the models, the engine's patch and building it yourself:
+[`docs/install.md`](docs/install.md).
 
-Showing the phrase while you speak is the desktop's job: any program (a bar, a notification, a
-voice assistant) can read `vocaline watch`.
+## The pieces
 
-## Pasting
+- **The daemon** (`vocaline daemon`, or the service): owns the microphone (PipeWire) and runs
+  one CrispASR per dictation. Its commands, the key and the paste:
+  [`docs/usage.md`](docs/usage.md).
+- **The event stream** (`vocaline watch`, or the socket `$XDG_RUNTIME_DIR/vocaline.sock`): one
+  JSON object per line, a versioned contract for every program that reads it:
+  [`docs/events.md`](docs/events.md).
+- **What makes it yours**: the configuration per machine (model, backend, cadence), your
+  vocabulary (`vocaline teach "foo bar" "Foobar"`), the rules per application, the filler words
+  and the statistics (`vocaline stats`): [`docs/configuration.md`](docs/configuration.md).
 
-Nothing is written while you speak: the phrases are cut at each pause and decoded right away,
-but only the event stream has them (a desktop shell can show them as a live preview). When the
-dictation stops (key released, second tap, `stop`), its phrases are joined, in order, and pasted
-once, as soon as the last open phrase is decoded. A dictation with no phrase pastes nothing.
+## Contributing
 
-The pause that cuts a phrase does not always end a sentence: the model punctuates each phrase
-alone. When a phrase ends with an ellipsis (`...` or `…`) or with no closing mark (`.`, `!`,
-`?`), the next one goes on from it: in the pasted text the ellipsis goes and the next phrase
-starts lowercase (`Je voulais dire... Que ça marche.` is pasted as `Je voulais dire que ça
-marche.`). A phrase that ended (`.`, `!`, `?`) is followed by a space and keeps its capital. A
-capital that is not the start of a sentence stays: `I`, a word in capitals (`NASA`), a word with
-a capital inside, a word your vocabulary writes with one. The ellipsis that ends the whole text
-stays. Only the pasted text is joined: `vocaline last` and the event stream keep one phrase each,
-as shown. With a rule's `drop_period`, the join comes first, then the period that ends the whole
-text goes.
+[`AGENTS.md`](AGENTS.md) says how the repository works, for people and for coding agents.
 
-The text is pasted in the window that had the focus when the dictation started, even if the
-focus moved since: the focus is given back to it first (if it was closed, the text goes where
-the focus is).
+## Licence and credits
 
-The phrase goes through the clipboard and a paste shortcut typed by `wtype`: Ctrl+Shift+V in a
-terminal (foot, Alacritty, kitty, Ghostty, WezTerm…), Ctrl+V elsewhere. The clipboard is put
-back as it was, with every type it held (a screenshot stays a screenshot), once the application
-has read the phrase and at least 400 ms after the paste: the application reads the clipboard on
-its own time after the shortcut, and a busy one (an Electron app whose main thread is held up)
-reads it a second later. One that has not read it after 2 s is taken as having dropped the
-shortcut. The shortcut is typed once the compositor holds the phrase, and 15 ms after the last
-read of it by a clipboard history, which reads each new selection at once. The text is offered
-with the `x-kde-passwordManagerHint` type, so a clipboard history that honours it keeps no copy
-of what was dictated.
+Free software under the [Apache License 2.0](LICENSE) ([`NOTICE`](NOTICE)). The package bundles
+[CrispASR](https://github.com/CrispStrobe/CrispASR) (MIT) with Vocaline's own patch. The models
+are downloaded by `vocaline setup` and are not part of Vocaline: Parakeet TDT 0.6B v3 by NVIDIA
+(CC-BY-4.0), as GGUF files from [cstr/parakeet-tdt-0.6b-v3-GGUF](https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF),
+and Silero VAD (MIT), from [ggml-org/whisper-vad](https://huggingface.co/ggml-org/whisper-vad).
 
-While a modifier is held (SUPER of SUPER+A, Ctrl, Alt, Shift), the paste waits for its release:
-pressed with it, the shortcut would be another one.
-
-It needs Hyprland with its Lua API (it is asked which window has the focus and which keys are
-down), `wtype`, and a compositor with the Wayland ext-data-control protocol. `vocaline start
---no-paste`, or `paste = false`, leaves the phrases in the event stream only.
-
-## Rules per application
-
-What you want after a dictation depends on where you dictate: a chat sends it, a terminal runs it,
-an assistant only listens. A rule says so for a window class (`hyprctl activewindow` shows it):
-
-```toml
-[[rule]]
-name = "terminal"
-class = "foot"           # case ignored; * stands for any run of characters
-enter = true             # press Enter once, after the paste
-drop_period = true       # no period at the end of the pasted text
-
-[[rule]]
-name = "chat"
-class = "org.example.*"
-enter = true
-vocabulary = ["foo bar -> Foobar"]   # same lines as vocabulary.txt, added to it
-
-[[rule]]
-name = "assistant"
-paste = false            # nothing is pasted, the phrases stay in the event stream
-```
-
-- **The first rule whose `class` matches wins**; a window that matches none gets the defaults
-  (paste, no Enter, the text as heard). The class is the one of the window that had the focus
-  when the dictation **started**, the same window the text is pasted in, not where the focus is
-  when it stops.
-- **`paste`** (default `true`), **`enter`** (default `false`) and **`drop_period`** (default
-  `false`) are all a rule can change about the paste. `enter` presses Return once, after the one
-  paste (and after the application has had time to read it, so a terminal runs the whole line);
-  it presses nothing when nothing was pasted. `drop_period` removes the period that ends the
-  whole text, not the ones inside it, and leaves `?`, `!` and an ellipsis alone. The `final`
-  events and `vocaline last` keep the phrases as heard: only the paste changes.
-- **`vocabulary`** adds lines (the format of the next section) to the common vocabulary, for the
-  dictations this rule governs; on the same heard words, the rule wins. It corrects the
-  partials, the finals and the paste, like the common one.
-- A rule needs a one-word `name`, used once. Without a `class` it never matches a window: it is
-  only reached by name. A mistake in a rule (unknown key, bad vocabulary line, repeated name)
-  stops the daemon at startup with the rule named.
-- With `paste = false` under `[output]`, or `start --no-paste`, nothing is pasted and the
-  window is not asked: no rule is chosen by window, and `--no-paste` takes no `--rule`. Under
-  `[output]`, a forced rule still adds its vocabulary.
-
-### Forcing a rule
-
-`vocaline start --rule terminal` makes the rule of that name govern the dictation, whatever the
-window, for a key bound to one use. So does `vocaline press --rule terminal`, because the key of
-the previous section is a `press` / `release` pair and the rule is only needed when the key
-starts the dictation (`release` takes none):
-
-```
-bind = SUPER, T, exec, vocaline press --rule terminal
-bindr = SUPER, T, exec, vocaline release
-```
-
-A name that is not a rule is refused before the microphone opens, and said in an `error` event.
-It governs that one dictation only. `toggle` takes no rule: use `start --rule` and `stop`.
-
-## Your own vocabulary
-
-Parakeet is very good in French but still writes some names its own way. After you see a
-mistake, one command fixes it for good:
-
-```sh
-vocaline teach "foo bar" "Foobar"
-```
-
-It adds a line to `$XDG_CONFIG_HOME/vocaline/vocabulary.txt` (usually
-`~/.config/vocaline/vocabulary.txt`), a plain file you can edit by hand:
-
-```
-# what the model writes -> what I want
-foo bar -> Foobar
-élodie -> Elodie
-```
-
-One entry per line; empty lines and lines starting with `#` are ignored; when two lines hear the
-same words the later one wins. Matching ignores case and accents, and respects word boundaries:
-`bar` changes `bar` and `sous-bar` but not `barbare`. An entry of several words matches them
-across any run of spaces. A line that cannot be read is named in an `error` event and left out;
-the others still apply.
-
-The correction happens where the engine's text enters the daemon, so the partial phrase, the
-final phrase (both in the event stream, see `docs/events.md`) and the pasted text hold the same
-words. The file is read again when a dictation starts: an entry applies from the next dictation,
-and `teach` works with no daemon running.
-
-`vocaline last` prints the last 20 final phrases of the session, as they were shown, one per
-line. They are kept in the daemon's memory only: never written to disk or to a log, and gone when
-the daemon stops.
-
-## Filler words
-
-The model writes everything that is said, hesitations included: `Mais surtout sur la partie
-euh... Vocaline et tout.` Vocaline drops the words of `filler_words` (see "Configuration")
-and the punctuation that hangs on them, so that phrase becomes `Mais surtout sur la partie
-Vocaline et tout.` No model is involved and it costs nothing.
-
-- Whole words only, case and accents ignored, like the vocabulary: `euh` goes, `heureux` and
-  `humain` stay. The words that carry a meaning (`bah`, `ben`, `bon`, `oui`, `yeah`) are not in
-  the default list; add the ones you want gone. An empty list (`filler_words = []`) turns the
-  step off.
-- A filler that started a phrase leaves the next word with a capital (`Euh, donc on y va.`
-  becomes `Donc on y va.`). A `.`, `!` or `?` hanging on a last filler goes back to the word
-  before it (`on y va, euh.` becomes `on y va.`); an ellipsis goes with it.
-- A phrase made only of fillers disappears: it is not pasted, not in `vocaline last`, and
-  it counts for no word in the statistics. Its `final` event still closes the utterance, with an
-  empty `text`.
-- It happens right after the vocabulary, where the engine's text comes in, so the partial
-  phrase, the final phrase and the pasted text hold the same words. `mm` is in the list because
-  the model writes it for a hum; right after a number (`5 mm`, `2,5 mm`) a filler word is a
-  unit, not a hesitation, and is kept.
-
-## Statistics
-
-```sh
-vocaline stats           # today, the last 7 days, all time
-vocaline stats --json    # the same, as one JSON object, for a program
-```
-
-For each period: the dictations, the words (without the filler words), the minutes heard, the time from the stop to the
-paste (median and maximum), and the same by application (the class of the window the dictation
-started in) and, for the last 7 days, by day, and how many dictations the GPU had no memory
-for, which were decoded on the CPU instead (the line shows only when there is one). A dictation that pastes nothing (`start --no-paste`,
-`paste = false`) does not ask for the window, so it is counted under `unknown`, like one whose
-window the desktop could not name. A dictation in which nothing was heard is not counted.
-
-The daemon appends one line per dictation to `$XDG_DATA_HOME/vocaline/stats.jsonl` (usually
-`~/.local/share/vocaline/stats.jsonl`) when the dictation ends; `stats` reads that file itself, so
-it works with no daemon running. Removing the package leaves it, like the configuration; delete
-it to start over.
-
-**No dictated text is stored**: a line holds the day, the class of the window, a word count, the
-audio duration in milliseconds, the time to paste in milliseconds and, for a dictation decoded
-on the CPU because the GPU was full, `"cpu_fallback":true`. Not a word of the text,
-not even a window title. If the file cannot be written, an `error` event says so and the
-dictation is pasted all the same.
-
-The time to paste runs from the stop (second tap, release, `stop`) to the moment the text is
-handed to the output, which then pastes it in a few tens of milliseconds more. The minutes are
-the time the microphone was heard, silences included.
+The logo and the banner are in [`assets/brand`](assets/brand/README.md); the banner is drawn in
+Fredoka, Open Sauce Sans and JetBrains Mono, under the SIL Open Font License 1.1
+([`assets/brand/fonts`](assets/brand/fonts/README.md)).
