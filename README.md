@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/brand/png/social-preview.png" alt="Vocaline: while you speak, the phrase forms in grey and freezes at each pause; when you stop, the dictation is pasted where you were typing" width="100%">
+<img src="assets/brand/png/social-preview.png" alt="Vocaline: the voice level, a phrase frozen after a pause and the next one still forming in grey, as the desktop shows them while you speak" width="100%">
 
 </div>
 
