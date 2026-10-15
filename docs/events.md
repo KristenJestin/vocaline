@@ -29,8 +29,8 @@ writes one command on one line, and reads the answer.
 `press` and `release` are for one key bound to both (hold to talk, or tap to start and tap to
 stop). A `release` with no `press` before it, or after a `press` that stopped the dictation, does
 nothing. A `press` while stopping is refused, like `start`. `start`, `stop` and `toggle` are for
-callers that are not a key. The event stream does not change with the rules per application (the
-README describes them): `partial` and `final` hold the phrases as heard, after the vocabulary,
+callers that are not a key. The event stream does not change with the rules per application (see
+[`configuration.md`](configuration.md#rules-per-application)): `partial` and `final` hold the phrases as heard, after the vocabulary,
 whatever a rule does to the paste. The only trace of a rule in the stream is an `error` event
 when a forced rule does not exist.
 
@@ -100,10 +100,10 @@ The states:
   readings in a row agree on the change, so the phrase does not blink between two readings. The
   last word follows the engine at once. The `final` is not steadied.
 - The text of `partial` and `final` is corrected by the user's vocabulary
-  (`$XDG_CONFIG_HOME/vocaline/vocabulary.txt`, see the README): the format does not change, only
+  (`$XDG_CONFIG_HOME/vocaline/vocabulary.txt`, see [`configuration.md`](configuration.md#your-own-vocabulary)): the format does not change, only
   the words inside. The vocabulary is read when a dictation starts; a line of it that cannot be
   read is reported by an `error` event at that moment, and the state goes on.
-- The filler words (`euh`, `uh`… the list is in the configuration, see the README) are dropped
+- The filler words (`euh`, `uh`… the list is in the configuration, see [`configuration.md`](configuration.md#filler-words)) are dropped
   from `partial` and `final`, after the vocabulary, with the punctuation that hangs on them. A
   utterance made only of fillers still ends with one `final`, whose `text` is empty: a reader
   skips it. `last` and the statistics do not keep it.
@@ -111,7 +111,7 @@ The states:
   `final` per phrase, as heard). A reader that wants the same text does the same: when a
   `final` ends with an ellipsis (`...` or `…`) or with no closing mark (`.`, `!`, `?`), drop the
   ellipsis and start the next one lowercase, unless its first word is `I`, in capitals, or has a
-  capital inside; the README gives the rule. Otherwise the two are joined by a space.
+  capital inside; [`usage.md`](usage.md#pasting) gives the rule. Otherwise the two are joined by a space.
 - A dictation the GPU had no memory for is not lost (since #38). The engine dies; the daemon
   publishes a `fallback` and stays `listening` until the dictation is stopped, the microphone
   still heard but nothing decoded. Once it stops, the whole dictation is decoded again on the

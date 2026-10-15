@@ -143,7 +143,7 @@ package() {
   install -Dm755 "$srcdir/target/release/vocaline" "$pkgdir/usr/bin/vocaline"
   install -Dm644 "$_root/packaging/vocaline.service" "$pkgdir/usr/lib/systemd/user/vocaline.service"
   install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" "$_root/LICENSE" "$_root/NOTICE"
-  install -Dm644 -t "$pkgdir/usr/share/doc/vocaline" "$_root/README.md" "$_root/docs/events.md"
+  install -Dm644 -t "$pkgdir/usr/share/doc/vocaline" "$_root/README.md" "$_root"/docs/*.md
 
   # The engine keeps the layout of the prebuilt bundle: crispasr finds its libraries beside itself.
   local engine="$pkgdir/usr/lib/vocaline/crispasr"
