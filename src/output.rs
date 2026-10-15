@@ -8,6 +8,7 @@
 
 use serde::Deserialize;
 use std::io::{self, Read};
+use std::os::fd::AsFd;
 use std::process::Command;
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -266,7 +267,12 @@ impl Worker {
     fn paste(&mut self, text: &str) -> io::Result<()> {
         self.wait_for_modifiers();
         if self.saved.is_none() {
-            self.saved = Some(self.ports.clipboard.save()?);
+            self.saved = Some(self.ports.clipboard.save().unwrap_or_else(|e| {
+                // The phrase is pasted all the same: losing the user's clipboard is better
+                // than losing the dictation too. Nothing saved is put back as empty.
+                eprintln!("vocaline: the clipboard could not be saved, it will be emptied: {e}");
+                Vec::new()
+            }));
         }
         let class = self.focus_target();
         self.wait_for_read();
@@ -465,19 +471,23 @@ impl Clipboard for Wayland {
             Err(Error::ClipboardEmpty | Error::NoSeats) => return Ok(Vec::new()),
             Err(e) => return Err(io::Error::other(e)),
         };
-        let mut contents = Vec::new();
+        let mut pipes = Vec::new();
         for mime in types {
-            let (mut pipe, _) = paste::get_contents(
+            // A type the source withdrew since is one type less, not a lost clipboard.
+            if let Ok((pipe, _)) = paste::get_contents(
                 ClipboardType::Regular,
                 Seat::Unspecified,
                 MimeType::Specific(&mime),
-            )
-            .map_err(io::Error::other)?;
-            let mut bytes = Vec::new();
-            pipe.read_to_end(&mut bytes)?;
-            contents.push((mime, bytes));
+            ) {
+                pipes.push((mime, pipe));
+            }
         }
-        Ok(contents)
+        if pipes.is_empty() {
+            return Err(io::Error::other(
+                "no type of the clipboard could be asked for",
+            ));
+        }
+        drain(pipes, STRAGGLER, UNSERVED)
     }
 
     fn set_text(&self, text: &str) -> io::Result<mpsc::Receiver<Instant>> {
@@ -500,6 +510,86 @@ impl Clipboard for Wayland {
         options.omit_additional_text_mime_types(true);
         options.copy_multi(sources).map_err(io::Error::other)
     }
+}
+
+/// How long the types still unread are waited for once the others stop coming: a source may
+/// offer a type it never serves (a Firefox-based browser offers `COMPOUND_TEXT` and
+/// `SAVE_TARGETS`), and keeps its pipe open without writing.
+const STRAGGLER: Duration = Duration::from_millis(100);
+/// How long a source that answers nothing is waited for: a busy one is slow, not stuck.
+const UNSERVED: Duration = Duration::from_secs(5);
+
+/// Reads every pipe to its end, all at once. A type still unread `straggler` after the last
+/// byte of any type came is dropped: the rest of the clipboard comes back without it, rather
+/// than no paste ever again. When none is read within `cap`, the clipboard is not saved.
+fn drain<P: Read + AsFd>(
+    pipes: Vec<(String, P)>,
+    straggler: Duration,
+    cap: Duration,
+) -> io::Result<Contents> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let offered = pipes.len();
+    let mut open: Vec<(String, P, Vec<u8>)> = pipes
+        .into_iter()
+        .map(|(mime, pipe)| (mime, pipe, Vec::new()))
+        .collect();
+    // In the order the source offered them, as they are put back.
+    let mut read: Vec<Option<(String, Vec<u8>)>> = (0..offered).map(|_| None).collect();
+    let mut index: Vec<usize> = (0..offered).collect();
+    let started = Instant::now();
+    let mut came = None;
+    let mut chunk = vec![0; 64 * 1024];
+    while !open.is_empty() {
+        let deadline = match came {
+            Some(at) => (started + cap).min(at + straggler),
+            None => started + cap,
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let mut fds: Vec<_> = open
+            .iter()
+            .map(|(_, pipe, _)| PollFd::new(pipe, PollFlags::IN))
+            .collect();
+        let timeout = Timespec::try_from(left).ok();
+        if poll(&mut fds, timeout.as_ref()).is_err_and(|e| e != rustix::io::Errno::INTR) {
+            break;
+        }
+        let ready: Vec<bool> = fds.iter().map(|fd| !fd.revents().is_empty()).collect();
+        drop(fds);
+        // Backwards, so removing one leaves the indices of the others still to visit.
+        for at in (0..open.len()).rev() {
+            if !ready[at] {
+                continue;
+            }
+            // A pipe that poll calls readable does not block a read.
+            match open[at].1.read(&mut chunk) {
+                Ok(0) => {
+                    let (mime, _, bytes) = open.remove(at);
+                    read[index.remove(at)] = Some((mime, bytes));
+                    came = Some(Instant::now());
+                }
+                Ok(n) => {
+                    open[at].2.extend_from_slice(&chunk[..n]);
+                    came = Some(Instant::now());
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                // A type that failed is dropped, as one that never answers.
+                Err(_) => {
+                    open.remove(at);
+                    index.remove(at);
+                }
+            }
+        }
+    }
+    let contents: Contents = read.into_iter().flatten().collect();
+    if contents.is_empty() && offered > 0 {
+        return Err(io::Error::other(
+            "the source of the clipboard did not answer",
+        ));
+    }
+    Ok(contents)
 }
 
 mod selection;

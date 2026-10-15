@@ -1,4 +1,5 @@
 use super::*;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -92,6 +93,8 @@ struct FakeClipboard {
     /// A clipboard history reads every new selection this long after it is set, whatever
     /// the shortcut.
     watched: Mutex<Option<Duration>>,
+    /// The source of the clipboard answers for none of its types.
+    unsaved: AtomicBool,
     log: Arc<Log>,
 }
 
@@ -119,6 +122,9 @@ impl FakeClipboard {
 impl Clipboard for FakeClipboard {
     fn save(&self) -> io::Result<Contents> {
         self.log.push(Did::Save);
+        if self.unsaved.load(Ordering::SeqCst) {
+            return Err(io::Error::other("the source did not answer"));
+        }
         Ok(self.contents.lock().unwrap().clone())
     }
 
@@ -234,6 +240,7 @@ fn setup() -> Setup {
         contents: Mutex::new(screenshot()),
         reads: Mutex::new(None),
         watched: Mutex::new(None),
+        unsaved: AtomicBool::new(false),
         log: Arc::clone(&log),
     });
     let keyboard = Arc::new(FakeKeyboard {
@@ -631,6 +638,92 @@ fn a_clipboard_history_that_reads_the_phrase_late_is_let_through_before_the_shor
     let s = setup();
     *s.clipboard.watched.lock().unwrap() = Some(QUIET / 2);
     s.application_reads_after(Some(BUSY));
+    s.begin();
+    s.output.phrase("Bonjour.".into());
+    assert_eq!(s.wait_for_pastes(1), ["Bonjour."]);
+}
+
+/// A clipboard type as its source serves it: a pipe, and the end the source writes to.
+fn served(mime: &str) -> ((String, io::PipeReader), io::PipeWriter) {
+    let (reader, writer) = io::pipe().unwrap();
+    ((mime.into(), reader), writer)
+}
+
+const STRAGGLER: Duration = Duration::from_millis(50);
+
+#[test]
+fn a_clipboard_none_of_whose_types_answers_is_not_saved() {
+    let (pipe, _held_open) = served("SAVE_TARGETS");
+    let started = Instant::now();
+    assert!(drain(vec![pipe], STRAGGLER, BUSY).is_err());
+    assert!(started.elapsed() < WAIT, "{:?}", started.elapsed());
+}
+
+#[test]
+fn the_types_that_answer_are_kept_when_one_never_does() {
+    let (text, mut writer) = served("text/plain");
+    let (compound, _held_open) = served("COMPOUND_TEXT");
+    let (html, mut html_writer) = served("text/html");
+    writer.write_all(b"copied").unwrap();
+    drop(writer);
+    html_writer.write_all(b"<b>copied</b>").unwrap();
+    drop(html_writer);
+    let started = Instant::now();
+    let kept = drain(vec![text, compound, html], STRAGGLER, WAIT).unwrap();
+    assert_eq!(
+        kept,
+        vec![
+            ("text/plain".to_string(), b"copied".to_vec()),
+            ("text/html".to_string(), b"<b>copied</b>".to_vec()),
+        ]
+    );
+    // Past the others, the one that never answers costs the straggler, not the cap.
+    assert!(started.elapsed() < WAIT / 2, "{:?}", started.elapsed());
+}
+
+#[test]
+fn a_source_slow_for_every_type_is_waited_for() {
+    let (text, mut writer) = served("text/plain");
+    let (html, mut html_writer) = served("text/html");
+    thread::spawn(move || {
+        thread::sleep(STRAGGLER * 4);
+        writer.write_all(b"copied").unwrap();
+        drop(writer);
+        html_writer.write_all(b"<b>copied</b>").unwrap();
+    });
+    assert_eq!(
+        drain(vec![text, html], STRAGGLER, WAIT).unwrap(),
+        vec![
+            ("text/plain".to_string(), b"copied".to_vec()),
+            ("text/html".to_string(), b"<b>copied</b>".to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn a_type_still_streaming_after_another_is_read_is_kept() {
+    let (text, writer) = served("text/plain");
+    let (image, mut image_writer) = served("image/png");
+    drop(writer);
+    thread::spawn(move || {
+        for _ in 0..6 {
+            image_writer.write_all(&[7; 1024]).unwrap();
+            thread::sleep(STRAGGLER / 2);
+        }
+    });
+    assert_eq!(
+        drain(vec![text, image], STRAGGLER, WAIT).unwrap(),
+        vec![
+            ("text/plain".to_string(), Vec::new()),
+            ("image/png".to_string(), vec![7; 6 * 1024]),
+        ]
+    );
+}
+
+#[test]
+fn a_phrase_is_pasted_when_the_clipboard_cannot_be_saved() {
+    let s = setup();
+    s.clipboard.unsaved.store(true, Ordering::SeqCst);
     s.begin();
     s.output.phrase("Bonjour.".into());
     assert_eq!(s.wait_for_pastes(1), ["Bonjour."]);
