@@ -150,6 +150,12 @@ fn player_call(player: &str, method: &str) -> io::Result<Vec<u8>> {
 }
 
 impl Mpris {
+    /// The arguments of the listing. Without `--acquired` it also names the services the bus
+    /// could start: asking one for its status would launch a player that is not running.
+    fn list_args() -> [&'static str; 2] {
+        ["list", "--acquired"]
+    }
+
     /// The names of the media players on the bus, from `busctl list`.
     fn parse_players(json: &[u8]) -> io::Result<Vec<String>> {
         let names: serde_json::Value = serde_json::from_slice(json)?;
@@ -186,7 +192,7 @@ impl Mpris {
 impl Media for Mpris {
     fn playing(&self) -> io::Result<Vec<String>> {
         let mut playing = Vec::new();
-        for player in Mpris::parse_players(&busctl(&["list"])?)? {
+        for player in Mpris::parse_players(&busctl(&Mpris::list_args())?)? {
             // A player that is gone since the list, or hangs, does not hide the others.
             match Mpris::status(&player) {
                 Ok(status) if status == "Playing" => playing.push(player),
@@ -228,6 +234,11 @@ mod tests {
             ]
         );
         assert!(Mpris::parse_players(b"not json").is_err());
+    }
+
+    #[test]
+    fn only_the_names_a_process_holds_are_listed() {
+        assert!(Mpris::list_args().contains(&"--acquired"));
     }
 
     #[test]
