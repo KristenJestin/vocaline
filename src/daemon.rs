@@ -8,6 +8,7 @@
 use crate::audio::{Capture, Microphone, SAMPLE_RATE, rms};
 use crate::engine::{Engine, EngineEvent, EngineInput, Failure};
 use crate::events::{Event, State, VERSION};
+use crate::media::Pauser;
 use crate::output::Paste;
 use crate::phrases::{self, Fillers};
 use crate::rules::{self, Rule};
@@ -193,6 +194,7 @@ pub fn spawn(
         vocabulary_file,
         Fillers::default(),
         rules,
+        None,
     )
 }
 
@@ -202,7 +204,8 @@ pub fn spawn(
 /// hand applies to the next dictation. The `fillers` are dropped from every phrase, after the
 /// vocabulary has corrected it. The first of `rules` that matches the window the
 /// dictation starts in governs it. What is kept of each dictation (counts and durations,
-/// never its text) goes to `ledger`, if any.
+/// never its text) goes to `ledger`, if any. The media players `media` is given are paused
+/// for the whole of each dictation.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_recording(
     ledger: Option<Box<dyn Ledger>>,
@@ -214,6 +217,7 @@ pub fn spawn_recording(
     vocabulary_file: PathBuf,
     fillers: Fillers,
     rules: Vec<Rule>,
+    media: Option<Pauser>,
 ) -> Handle {
     let (messages, inbox) = mpsc::channel();
     let mut core = Core {
@@ -245,6 +249,7 @@ pub fn spawn_recording(
         ledger,
         tally: None,
         stopped_at: None,
+        media,
     };
     thread::spawn(move || {
         for message in inbox {
@@ -301,6 +306,7 @@ struct Core {
     tally: Option<Tally>,
     /// When the current dictation was told to stop: the paste is timed from there.
     stopped_at: Option<Instant>,
+    media: Option<Pauser>,
 }
 
 /// What is kept of a dictation: counts, never its text.
@@ -465,6 +471,10 @@ impl Core {
         self.cpu = None;
         self.stopped_at = None;
         self.read_vocabulary();
+        // Once nothing can fail any more: a start that is refused pauses nothing.
+        if let Some(media) = &self.media {
+            media.pause();
+        }
         self.set(State::Loading);
         Ok(State::Loading)
     }
@@ -700,6 +710,11 @@ impl Core {
         if self.state != state {
             if state == State::Stopping {
                 self.stopped_at = Some((self.clock)());
+            }
+            // However the dictation ended; before the stream tells it, so a client that sees
+            // `Idle` knows the players have been asked.
+            if let (State::Idle, Some(media)) = (state, &self.media) {
+                media.resume();
             }
             self.state = state;
             self.bus.publish(&Event::State { state });

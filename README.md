@@ -126,9 +126,16 @@ hold_ms = 250                                 # a key held this long stops on re
 [output]
 paste = true                                  # false: the phrases are only in the event stream
 
+[media]
+pause = false                                 # true: the players that are playing (MPRIS) are paused while you dictate, then play again
+
 [text]
 filler_words = ["euh", "heu", "euhm", "hum", "hmm", "mmh", "uh", "um", "mm"]  # dropped from every phrase; []: off
 ```
+
+With `pause = true`, only the players Vocaline paused play again, and only if they are still paused.
+It talks to the session bus through `busctl` (part of systemd); a player it cannot reach is a
+warning in the log, never a failed dictation.
 
 Rules per application are `[[rule]]` tables, none by default: see "Rules per application".
 

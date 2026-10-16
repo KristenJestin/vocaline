@@ -4,6 +4,7 @@ mod config;
 mod daemon;
 mod engine;
 mod events;
+mod media;
 mod output;
 mod phrases;
 mod rules;
@@ -123,6 +124,7 @@ fn run_daemon(dirs: &Dirs, audio_file: Option<&Path>) -> Result<(), String> {
             dirs.vocabulary_file(),
             Fillers::new(&config.text.filler_words),
             config.rule,
+            media::Pauser::for_config(&config.media, Arc::new(media::Mpris)),
         ),
     );
     Ok(())
