@@ -69,6 +69,7 @@ pub struct Config {
     pub engine: EngineConfig,
     pub key: KeyConfig,
     pub output: OutputConfig,
+    pub media: MediaConfig,
     pub text: TextConfig,
     /// What a dictation does depending on its window, first match wins (see `rules`).
     pub rule: Vec<Rule>,
@@ -86,6 +87,14 @@ impl Default for OutputConfig {
     fn default() -> OutputConfig {
         OutputConfig { paste: true }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MediaConfig {
+    /// Pause the media players that are playing while a dictation runs, and play again the ones
+    /// it paused.
+    pub pause: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -248,6 +257,13 @@ mod tests {
         assert_eq!(Config::parse("", &dirs()).unwrap().key.hold_ms, 250);
         let config = Config::parse("[key]\nhold_ms = 400", &dirs()).unwrap();
         assert_eq!(config.key.hold_ms, 400);
+    }
+
+    #[test]
+    fn the_media_section_is_read_from_the_configuration() {
+        assert!(!Config::parse("", &dirs()).unwrap().media.pause);
+        let config = Config::parse("[media]\npause = true", &dirs()).unwrap();
+        assert!(config.media.pause);
     }
 
     #[test]

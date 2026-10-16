@@ -1,6 +1,8 @@
 use super::*;
 use crate::audio::Capture;
+use crate::config::MediaConfig;
 use crate::engine::{EngineInput, Failure, Sink};
+use crate::media::{Media, Pauser};
 use crate::phrases::Fillers;
 use crate::rules::Rule;
 use std::collections::VecDeque;
@@ -2070,6 +2072,7 @@ fn recording_daemon(
         no_vocabulary(),
         Fillers::default(),
         rules,
+        None,
     )
 }
 
@@ -2389,6 +2392,7 @@ fn filler_daemon(engine: FakeEngine, fillers: Fillers, file: PathBuf) -> (Handle
         file,
         fillers,
         Vec::new(),
+        None,
     );
     (handle, paste)
 }
@@ -2933,4 +2937,271 @@ fn a_gpu_memory_failure_with_no_engine_on_the_cpu_is_an_error() {
         },
         state(State::Idle),
     ]);
+}
+
+/// The media players of a fake session, by name and whether each plays; what is paused and
+/// played again is kept, in order.
+#[derive(Default)]
+struct FakeMedia {
+    players: Mutex<Vec<(String, bool)>>,
+    /// The session bus is not there.
+    gone: bool,
+    calls: Mutex<Vec<String>>,
+}
+
+impl FakeMedia {
+    fn with(players: &[(&str, bool)]) -> Arc<FakeMedia> {
+        Arc::new(FakeMedia {
+            players: Mutex::new(players.iter().map(|(n, p)| (n.to_string(), *p)).collect()),
+            ..FakeMedia::default()
+        })
+    }
+
+    /// A player started or paused by hand.
+    fn set(&self, player: &str, playing: bool) {
+        let mut players = self.players.lock().unwrap();
+        players.iter_mut().find(|(n, _)| n == player).unwrap().1 = playing;
+    }
+
+    fn is_playing(&self, player: &str) -> bool {
+        let players = self.players.lock().unwrap();
+        players.iter().find(|(n, _)| n == player).unwrap().1
+    }
+
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn reach(&self) -> io::Result<()> {
+        if self.gone {
+            return Err(io::Error::other("no session bus"));
+        }
+        Ok(())
+    }
+
+    fn act(&self, verb: &str, player: &str, playing: bool) -> io::Result<()> {
+        self.reach()?;
+        self.calls.lock().unwrap().push(format!("{verb} {player}"));
+        self.set(player, playing);
+        Ok(())
+    }
+}
+
+impl Media for FakeMedia {
+    fn playing(&self) -> io::Result<Vec<String>> {
+        self.reach()?;
+        let players = self.players.lock().unwrap();
+        Ok(players
+            .iter()
+            .filter(|p| p.1)
+            .map(|p| p.0.clone())
+            .collect())
+    }
+
+    fn is_paused(&self, player: &str) -> io::Result<bool> {
+        self.reach()?;
+        Ok(!self.is_playing(player))
+    }
+
+    fn pause(&self, player: &str) -> io::Result<()> {
+        self.act("pause", player, false)
+    }
+
+    fn play(&self, player: &str) -> io::Result<()> {
+        self.act("play", player, true)
+    }
+}
+
+/// A daemon over `media`, configured with `pause`; the pauser is also handed back, to wait for
+/// the media calls to be done.
+fn media_daemon(
+    media: &Arc<FakeMedia>,
+    config: &MediaConfig,
+    mic: FakeMic,
+    engine: FakeEngine,
+) -> (Handle, Pauser) {
+    let wired = Pauser::for_config(config, media.clone());
+    // Off, the daemon gets no pauser: the one handed back then waits for nothing.
+    let pauser = wired
+        .clone()
+        .unwrap_or_else(|| Pauser::spawn(media.clone()));
+    let handle = spawn_recording(
+        None,
+        Arc::new(mic),
+        Arc::new(engine),
+        Some(Box::new(FakePaste::in_window("org.example.Editor"))),
+        HOLD,
+        Arc::new(Instant::now),
+        no_vocabulary(),
+        Fillers::default(),
+        Vec::new(),
+        wired,
+    );
+    (handle, pauser)
+}
+
+const ON: MediaConfig = MediaConfig { pause: true };
+
+/// A whole dictation: started, listening, stopped, back to idle, and the media calls done.
+fn dictate_with_media(daemon: &Handle, pauser: &Pauser, start: Command) {
+    let watcher = Watcher::on(daemon);
+    daemon.command(start).unwrap();
+    watcher.skip_to(&state(State::Listening));
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    pauser.settle();
+}
+
+#[test]
+fn media_is_left_alone_by_default() {
+    let media = FakeMedia::with(&[("music", true)]);
+    let (daemon, pauser) = media_daemon(
+        &media,
+        &MediaConfig::default(),
+        FakeMic::default(),
+        ready_engine(),
+    );
+    dictate_with_media(&daemon, &pauser, Command::Start);
+    assert_eq!(media.calls(), Vec::<String>::new());
+    assert!(media.is_playing("music"));
+}
+
+#[test]
+fn playing_players_are_paused_when_a_dictation_starts() {
+    let media = FakeMedia::with(&[("music", true), ("video", true)]);
+    let (daemon, pauser) = media_daemon(&media, &ON, FakeMic::default(), ready_engine());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&state(State::Listening));
+    pauser.settle();
+    assert_eq!(media.calls(), ["pause music", "pause video"]);
+    assert!(!media.is_playing("music") && !media.is_playing("video"));
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Idle));
+}
+
+#[test]
+fn a_player_already_paused_is_not_played_at_the_stop() {
+    let media = FakeMedia::with(&[("music", true), ("podcast", false)]);
+    let (daemon, pauser) = media_daemon(&media, &ON, FakeMic::default(), ready_engine());
+    dictate_with_media(&daemon, &pauser, Command::Start);
+    assert_eq!(media.calls(), ["pause music", "play music"]);
+    assert!(!media.is_playing("podcast"));
+}
+
+#[test]
+fn only_the_players_vocaline_paused_play_again_at_the_stop() {
+    let media = FakeMedia::with(&[("music", true), ("podcast", false), ("video", true)]);
+    let (daemon, pauser) = media_daemon(&media, &ON, FakeMic::default(), ready_engine());
+    dictate_with_media(&daemon, &pauser, Command::Start);
+    assert_eq!(
+        media.calls(),
+        ["pause music", "pause video", "play music", "play video"]
+    );
+    assert!(media.is_playing("music") && media.is_playing("video"));
+    assert!(!media.is_playing("podcast"));
+}
+
+#[test]
+fn a_player_played_by_hand_during_the_dictation_is_left_alone() {
+    let media = FakeMedia::with(&[("music", true), ("video", true)]);
+    let (daemon, pauser) = media_daemon(&media, &ON, FakeMic::default(), ready_engine());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Start).unwrap();
+    watcher.skip_to(&state(State::Listening));
+    pauser.settle();
+    media.set("music", true);
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    pauser.settle();
+    assert_eq!(media.calls(), ["pause music", "pause video", "play video"]);
+}
+
+#[test]
+fn the_pause_covers_the_whole_dictation_not_each_phrase() {
+    let media = FakeMedia::with(&[("music", true)]);
+    let (daemon, pauser) = media_daemon(&media, &ON, FakeMic::default(), two_closed_phrases());
+    let watcher = Watcher::on(&daemon);
+    daemon.command(Command::Toggle).unwrap();
+    watcher.skip_to(&ev_final(2, "Ça va ?"));
+    pauser.settle();
+    assert_eq!(media.calls(), ["pause music"]);
+    daemon.command(Command::Toggle).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    pauser.settle();
+    assert_eq!(media.calls(), ["pause music", "play music"]);
+}
+
+#[test]
+fn players_play_again_when_the_engine_fails() {
+    let failing = FakeEngine {
+        script: vec![
+            (0, EngineEvent::Ready),
+            (1_600, EngineEvent::Ended(Err("the engine stopped".into()))),
+        ],
+        ..FakeEngine::default()
+    };
+    let leaving = FakeEngine {
+        script: vec![(0, EngineEvent::Ready), (1_600, EngineEvent::Ended(Ok(())))],
+        ..FakeEngine::default()
+    };
+    for engine in [failing, leaving] {
+        let media = FakeMedia::with(&[("music", true)]);
+        let (daemon, pauser) = media_daemon(&media, &ON, FakeMic::default(), engine);
+        let watcher = Watcher::on(&daemon);
+        daemon.command(Command::Start).unwrap();
+        watcher.skip_to(&state(State::Listening));
+        watcher.skip_to(&state(State::Idle));
+        pauser.settle();
+        assert_eq!(media.calls(), ["pause music", "play music"]);
+    }
+}
+
+#[test]
+fn a_start_that_fails_pauses_nothing() {
+    let broken_engine = FakeEngine {
+        fail: true,
+        ..FakeEngine::default()
+    };
+    let no_mic = FakeMic {
+        fail: true,
+        ..FakeMic::default()
+    };
+    for (mic, engine) in [
+        (FakeMic::default(), broken_engine),
+        (no_mic, ready_engine()),
+    ] {
+        let media = FakeMedia::with(&[("music", true)]);
+        let (daemon, pauser) = media_daemon(&media, &ON, mic, engine);
+        assert!(daemon.command(Command::Start).is_err());
+        pauser.settle();
+        assert_eq!(media.calls(), Vec::<String>::new());
+        assert!(media.is_playing("music"));
+    }
+}
+
+#[test]
+fn a_dictation_without_paste_pauses_too() {
+    let media = FakeMedia::with(&[("music", true)]);
+    let (daemon, pauser) = media_daemon(&media, &ON, FakeMic::default(), ready_engine());
+    dictate_with_media(&daemon, &pauser, Command::StartNoPaste);
+    assert_eq!(media.calls(), ["pause music", "play music"]);
+}
+
+#[test]
+fn a_media_error_does_not_stop_the_dictation() {
+    let media = Arc::new(FakeMedia {
+        gone: true,
+        ..FakeMedia::default()
+    });
+    let (daemon, pauser) = media_daemon(&media, &ON, FakeMic::default(), two_phrases());
+    let watcher = Watcher::on(&daemon);
+    assert_eq!(daemon.command(Command::Start), Ok(State::Loading));
+    watcher.skip_to(&state(State::Listening));
+    watcher.skip_to(&ev_final(1, "Bonjour."));
+    daemon.command(Command::Stop).unwrap();
+    watcher.skip_to(&state(State::Idle));
+    pauser.settle();
+    assert_eq!(daemon.command(Command::Status), Ok(State::Idle));
+    assert_eq!(media.calls(), Vec::<String>::new());
 }
