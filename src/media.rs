@@ -178,6 +178,12 @@ impl Mpris {
             .ok_or_else(|| io::Error::other("no playback status"))
     }
 
+    /// Some players, a live stream for one, answer `Pause` by stopping: they are as paused as
+    /// the others, and must play again too.
+    fn paused(status: &str) -> bool {
+        status != "Playing"
+    }
+
     fn status(player: &str) -> io::Result<String> {
         Mpris::parse_status(&busctl(&[
             "get-property",
@@ -204,7 +210,7 @@ impl Media for Mpris {
     }
 
     fn is_paused(&self, player: &str) -> io::Result<bool> {
-        Ok(Mpris::status(player)? == "Paused")
+        Ok(Mpris::paused(&Mpris::status(player)?))
     }
 
     fn pause(&self, player: &str) -> io::Result<()> {
@@ -239,6 +245,13 @@ mod tests {
     #[test]
     fn only_the_names_a_process_holds_are_listed() {
         assert!(Mpris::list_args().contains(&"--acquired"));
+    }
+
+    #[test]
+    fn a_player_that_reports_stopped_after_the_pause_counts_as_paused() {
+        assert!(Mpris::paused("Paused"));
+        assert!(Mpris::paused("Stopped"));
+        assert!(!Mpris::paused("Playing"));
     }
 
     #[test]
