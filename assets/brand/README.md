@@ -18,7 +18,8 @@ transforms are the maintainer's, never redrawn by a tool.
 | `icon.svg` | the icon: the mark on a dark rounded square |
 | `icon-full.svg` | the full icon, a yellow square with dark strokes |
 | `favicon.svg` | the favicon, drawn for 16 to 64 pixels |
-| `social-preview.svg` | the social preview of the repository and the banner of the README: the mark, the name and the tagline, the header every project of the maintainer shares, and under it a picture of Vocaline's own: the island of the desktop drawn large, the voice, the frozen phrase and the phrase still forming, each one named as the event stream names it (drawn, no capture) |
+| `screen.svg` | a scene of Vocaline, drawn (no capture), on a transparent ground: a message being written, and the pill at the bottom of the screen with the voice, the phrase already frozen in white and its end still forming in grey; a dotted arrow shows where the dictation lands when you stop |
+| `social-preview.svg` | the social preview of the repository and the banner of the README: the mark, the name and the tagline, the header every project of the maintainer shares, and under it `screen.svg` on a plain screen |
 
 `png/` holds the icon at 128, 256, 512 and 1024 pixels, the full icon at 512, the favicon at 16
 and 32, `apple-touch-icon.png`, and `social-preview.png`; `favicon.ico` holds the favicon at 16,
@@ -26,9 +27,9 @@ and 32, `apple-touch-icon.png`, and `social-preview.png`; `favicon.ico` holds th
 
 ## The social preview
 
-`tools/brand.sh` renders `png/social-preview.png` from `social-preview.svg` with `rsvg-convert`
+`tools/brand.sh` renders `png/social-preview.png` from `social-preview.svg`, and `png/screen.png` from `screen.svg`, with `rsvg-convert`
 (librsvg), with the fonts of [`fonts/`](fonts/README.md) only: Fredoka for the name, Open Sauce
-Sans for the text, JetBrains Mono for the events. The positions of the notes follow the width of the text they hang from: moving a word means measuring it again. Edit the SVG, run it again, commit both.
+Sans for the text. `social-preview.svg` embeds `screen.svg`, so both are rendered together. In `screen.svg`, the pill and its caret follow the width of the phrase: changing a word means measuring it again. Edit the SVG, run it again, commit both.
 
 `png/social-preview.png` is uploaded by hand in the repository's settings on GitHub (Settings,
 General, Social preview), as GitHub offers no other way.

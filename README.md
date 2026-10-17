@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/brand/png/social-preview.png" alt="Vocaline: the voice level, a phrase frozen after a pause and the next one still forming in grey, as the desktop shows them while you speak" width="100%">
+<img src="assets/brand/png/social-preview.png" alt="Vocaline: a message being written, and at the bottom of the screen the pill where the dictation forms, the voice, a phrase already frozen and the next one still in grey" width="100%">
 
 </div>
 
