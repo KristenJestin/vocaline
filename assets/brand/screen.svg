@@ -2,57 +2,57 @@
 <!-- A message being written, and Vocaline's pill at the bottom of the screen: the voice, the phrase
      already frozen in white, the end still forming in grey. When the speaker stops, the whole
      dictation lands where the caret waits in the message. Drawn, no capture. The ground is
-     transparent; social-preview.svg puts a screen under it. The pill and its caret follow the
-     width of the phrase: changing a word means measuring it again. -->
+     transparent; social-preview.svg puts a screen under it. Made by a script that measures the
+     text: moving a word means drawing it again. -->
 <defs>
 <filter id="shadow" x="-20%" y="-20%" width="140%" height="160%"><feDropShadow dx="0" dy="24" stdDeviation="28" flood-color="#000" flood-opacity="0.55"/></filter>
 <linearGradient id="avatar" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6fb3e0"/><stop offset="1" stop-color="#3f6fc0"/></linearGradient>
 </defs>
 
 <!-- The message. -->
-<rect x="470" y="170" width="930" height="400" rx="22" fill="#0b0a09" filter="url(#shadow)"/>
-<rect x="470" y="170" width="930" height="400" rx="22" fill="none" stroke="#24211d" stroke-width="1.5"/>
-<g fill="#3a342c"><circle cx="500" cy="200" r="7"/><circle cx="524" cy="200" r="7"/><circle cx="548" cy="200" r="7"/></g>
-<text x="935" y="207" text-anchor="middle" font-family="Open Sauce Sans" font-weight="600" font-size="19" fill="#a39b8c">New message</text>
-<rect x="470" y="230" width="930" height="1.5" fill="#1d1b19"/>
+<rect x="700" y="170" width="820" height="400" rx="22" fill="#0b0a09" filter="url(#shadow)"/>
+<rect x="700" y="170" width="820" height="400" rx="22" fill="none" stroke="#24211d" stroke-width="1.5"/>
+<g fill="#3a342c"><circle cx="730" cy="200" r="7"/><circle cx="754" cy="200" r="7"/><circle cx="778" cy="200" r="7"/></g>
+<text x="1110" y="207" text-anchor="middle" font-family="Open Sauce Sans" font-weight="600" font-size="19" fill="#a39b8c">New message</text>
+<rect x="700" y="230" width="820" height="1.5" fill="#1d1b19"/>
 <g font-family="Open Sauce Sans" font-size="21">
-<text x="510" y="280" fill="#8a847c">To</text>
-<circle cx="629" cy="273" r="15" fill="url(#avatar)"/>
-<text x="629" y="279" text-anchor="middle" font-weight="600" font-size="15" fill="#fff">L</text>
-<text x="654" y="280" fill="#ece5d8">Léa</text>
-<rect x="510" y="304" width="850" height="1.5" fill="#1d1b19"/>
-<text x="510" y="350" fill="#8a847c">Subject</text>
-<text x="614" y="350" fill="#ece5d8">Tomorrow&#x27;s meeting</text>
-<rect x="510" y="374" width="850" height="1.5" fill="#1d1b19"/>
-<text x="510" y="432" font-size="23" fill="#ece5d8">Hi Léa,</text>
+<text x="740" y="280" fill="#8a847c">To</text>
+<circle cx="859" cy="273" r="15" fill="url(#avatar)"/>
+<text x="859" y="279" text-anchor="middle" font-weight="600" font-size="15" fill="#fff">L</text>
+<text x="884" y="280" fill="#ece5d8">Léa</text>
+<rect x="740" y="304" width="740" height="1.5" fill="#1d1b19"/>
+<text x="740" y="350" fill="#8a847c">Subject</text>
+<text x="844" y="350" fill="#ece5d8">Tomorrow&#x27;s meeting</text>
+<rect x="740" y="374" width="740" height="1.5" fill="#1d1b19"/>
+<text x="740" y="432" font-size="23" fill="#ece5d8">Hi Léa,</text>
 </g>
-<rect x="510" y="450" width="3" height="30" rx="1.5" fill="#edd643"/>
-<rect x="1261" y="500" width="99" height="42" rx="21" fill="#24211d"/>
-<text x="1310.5" y="528" text-anchor="middle" font-family="Open Sauce Sans" font-weight="600" font-size="20" fill="#ece5d8">Send</text>
+<rect x="740" y="450" width="3" height="30" rx="1.5" fill="#edd643"/>
+<rect x="1381" y="500" width="99" height="42" rx="21" fill="#24211d"/>
+<text x="1430.5" y="528" text-anchor="middle" font-family="Open Sauce Sans" font-weight="600" font-size="20" fill="#ece5d8">Send</text>
 
 <!-- Where the dictation goes once the speaker stops. -->
-<path d="M511.5 648 V 496" fill="none" stroke="#edd643" stroke-opacity="0.6" stroke-width="2.5" stroke-dasharray="1 9" stroke-linecap="round"/>
-<path d="M503.5 500 l8 -9 l8 9" fill="none" stroke="#edd643" stroke-opacity="0.6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M741.5 648 V 496" fill="none" stroke="#edd643" stroke-opacity="0.6" stroke-width="2.5" stroke-dasharray="1 9" stroke-linecap="round"/>
+<path d="M733.5 500 l8 -9 l8 9" fill="none" stroke="#edd643" stroke-opacity="0.6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
 
 <!-- The pill: the voice, the frozen phrase, the end still forming. -->
-<rect x="466" y="660" width="938" height="96" rx="48" fill="#050505" filter="url(#shadow)"/>
-<rect x="466" y="660" width="938" height="96" rx="48" fill="none" stroke="#24211d" stroke-width="1.5"/>
+<rect x="673" y="660" width="874" height="88" rx="44" fill="#050505" filter="url(#shadow)"/>
+<rect x="673" y="660" width="874" height="88" rx="44" fill="none" stroke="#24211d" stroke-width="1.5"/>
 <g fill="#edd643">
-<rect x="510.0" y="703.0" width="6" height="10" rx="3"/>
-<rect x="521.0" y="699.0" width="6" height="18" rx="3"/>
-<rect x="532.0" y="693.0" width="6" height="30" rx="3"/>
-<rect x="543.0" y="686.0" width="6" height="44" rx="3"/>
-<rect x="554.0" y="695.0" width="6" height="26" rx="3"/>
-<rect x="565.0" y="689.0" width="6" height="38" rx="3"/>
-<rect x="576.0" y="682.0" width="6" height="52" rx="3"/>
-<rect x="587.0" y="691.0" width="6" height="34" rx="3"/>
-<rect x="598.0" y="698.0" width="6" height="20" rx="3"/>
-<rect x="609.0" y="693.0" width="6" height="30" rx="3"/>
-<rect x="620.0" y="685.0" width="6" height="46" rx="3"/>
-<rect x="631.0" y="688.0" width="6" height="40" rx="3"/>
-<rect x="642.0" y="696.0" width="6" height="24" rx="3"/>
-<rect x="653.0" y="701.0" width="6" height="14" rx="3"/>
+<rect x="717.0" y="699.0" width="6" height="10" rx="3"/>
+<rect x="728.0" y="695.0" width="6" height="18" rx="3"/>
+<rect x="739.0" y="689.0" width="6" height="30" rx="3"/>
+<rect x="750.0" y="682.0" width="6" height="44" rx="3"/>
+<rect x="761.0" y="691.0" width="6" height="26" rx="3"/>
+<rect x="772.0" y="685.0" width="6" height="38" rx="3"/>
+<rect x="783.0" y="678.0" width="6" height="52" rx="3"/>
+<rect x="794.0" y="687.0" width="6" height="34" rx="3"/>
+<rect x="805.0" y="694.0" width="6" height="20" rx="3"/>
+<rect x="816.0" y="689.0" width="6" height="30" rx="3"/>
+<rect x="827.0" y="681.0" width="6" height="46" rx="3"/>
+<rect x="838.0" y="684.0" width="6" height="40" rx="3"/>
+<rect x="849.0" y="692.0" width="6" height="24" rx="3"/>
+<rect x="860.0" y="697.0" width="6" height="14" rx="3"/>
 </g>
-<text x="693.0" y="721" font-family="Fredoka" font-size="38" xml:space="preserve"><tspan font-weight="600" fill="#ece5d8">I&#x27;ll send you the report.</tspan><tspan font-weight="500" fill="#7d7567"> And the slides</tspan></text>
-<line x1="1354.0" y1="684" x2="1354.0" y2="732" stroke="#edd643" stroke-width="5" stroke-linecap="round"/>
+<text x="900.0" y="716" font-family="Fredoka" font-size="34" xml:space="preserve"><tspan font-weight="600" fill="#ece5d8">I&#x27;ll send you the report.</tspan><tspan font-weight="500" fill="#7d7567"> And the slides</tspan></text>
+<line x1="1497.0" y1="682" x2="1497.0" y2="726" stroke="#edd643" stroke-width="5" stroke-linecap="round"/>
 </svg>

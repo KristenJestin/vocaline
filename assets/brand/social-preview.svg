@@ -15,7 +15,7 @@
 <rect x="96" y="290" width="1088" height="400" fill="#1a1714"/>
 <rect x="96" y="290" width="1088" height="400" fill="url(#dots)"/>
 <rect x="96" y="290" width="1088" height="400" fill="url(#glow)"/>
-<image href="screen.svg" xlink:href="screen.svg" x="42" y="131" width="1024" height="640"/>
+<image href="screen.svg" xlink:href="screen.svg" x="-70.4" y="136.3" width="1024" height="640"/>
 </g>
 <rect x="96" y="290" width="1088" height="400" rx="18" fill="none" stroke="#2e2a24" stroke-width="2"/>
 </svg>
