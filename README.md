@@ -349,3 +349,7 @@ dictation is pasted all the same.
 The time to paste runs from the stop (second tap, release, `stop`) to the moment the text is
 handed to the output, which then pastes it in a few tens of milliseconds more. The minutes are
 the time the microphone was heard, silences included.
+
+## Licence
+
+Free software under the [AGPL-3.0](LICENSE). The CrispASR engine it bundles keeps its own MIT licence ([`NOTICE`](NOTICE)).

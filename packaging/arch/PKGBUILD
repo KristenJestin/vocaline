@@ -7,8 +7,8 @@ pkgrel=1
 pkgdesc='Local dictation: the phrase shows while you speak, and is pasted when you stop'
 arch=(x86_64)
 url='https://github.com/KristenJestin/vocaline'
-# Vocaline is Apache-2.0; the CrispASR it bundles, with its ggml, is MIT.
-license=(Apache-2.0 MIT)
+# Vocaline is AGPL-3.0-only; the CrispASR it bundles, with its ggml, is MIT.
+license=(AGPL-3.0-only MIT)
 depends=(
   gcc-libs glibc
   libgomp   # CrispASR's threads

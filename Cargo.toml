@@ -2,7 +2,7 @@
 name = "vocaline"
 version = "0.1.2"
 edition = "2024"
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 description = "Live local dictation: the phrase shows while you speak, and is pasted at the pause"
 
 [dependencies]
